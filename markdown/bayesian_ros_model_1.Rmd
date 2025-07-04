@@ -6,6 +6,7 @@ output: github_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
+library(dplyr)
 library(here)
 
 library(cmdstanr)
@@ -19,24 +20,492 @@ if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
 
 ```
 
-## GitHub Documents
+## Bayesian ROS model step by step
 
-This is an R Markdown format used for publishing markdown documents to GitHub. When you click the **Knit** button all R code chunks are run and a markdown file (.md) suitable for publishing to GitHub is generated.
+This doc loads ROS and weather data, and then builds a Bayesian ROS model step by step.
 
-## Including Code
 
-You can include R code in the document as follows:
+## Helper code
 
-```{r cars}
-summary(cars)
+A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+
+```{r}
+
+get_samples <- function(model_code, data=list(), 
+                        model_dir = MODEL_DIR, 
+                        model_basename = NULL,
+                        seed=123, chains=4) {
+  
+  if (is.null(model_basename)) {
+    model_basename <- deparse(substitute(model_code))
+    
+    # remove '_code' from the base name if present
+    model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+  }
+  
+  f <- write_stan_file(model_code, 
+                       dir = model_dir, 
+                       basename = model_basename)
+  
+  model_x <- cmdstan_model(f)
+  samples_1 <- model_x$sample(
+    data = data,
+    seed = seed,
+    chains = chains,
+    parallel_chains = chains,
+    refresh = 0
+  )
+  pr <- as_draws_rvars( samples_1$draws() )
+  p <- list()
+  for ( i in 1:length(pr) )
+    p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+  return(p)
+}
+
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+
+## ROS and weather
+
+Load the ROS and weather data. Select a couple of weather variables to use as predictors for an initial model. Summarise the data
+
+```{r}
+dat.ros <- readRDS(here("data/lines.rds")) 
+dat.weather <- readRDS(here("data/weatherhourly.rds"))
+
+#select relevant ROS variable - ros and lineid, which matches lineid in weather data
+dat.ros <- dat.ros %>% 
+  select(lineid,ros=ros_kmh,
+         start_time_utc,
+         end_time_utc)
+
+#select weather variables
+#mean refers to mean of all barra cells that intersect the spread line.
+dat.weather <- dat.weather %>% 
+  select(lineid,
+         wind=sfcWind_mean,
+         rh=hurs_mean,
+         time_utc_hourly
+  ) %>% 
+  
+  mutate(wind=wind*3.6)
+
+
+#weather is sampled hourly for the spread time of each line
+#add variable to identify if BARRA sample is before, during or after spread time
+dat.weather <- dat.weather %>% 
+  left_join(dat.ros %>% select(lineid,start_time_utc,end_time_utc)) %>% 
+  
+  #round start and end times, to match barra times
+  mutate(start_time_utc_round=lubridate::round_date(start_time_utc,unit = "hours"),
+         end_time_utc_round=lubridate::round_date(end_time_utc,unit = "hours")) %>% 
+  
+  
+  #remove any sampled barra weather from after end time
+  filter(time_utc_hourly <= end_time_utc_round) %>% 
+  
+  #calculate time difference between barra sample time and start time
+  #this may be useful to know, for example, wind speed 1 hour vs 3 hours before spread
+  mutate(diff_start_hour=as.numeric(difftime(time_utc_hourly,start_time_utc_round,units = "hours"))) %>% 
+  
+  
+  select(lineid,wind,rh,diff_start_hour)
+
+
+#plot some of the weather and ros
+
+
+dat.ros %>% 
+  ggplot() +
+  geom_histogram(aes(x=ros))
+
+sample.ids <- sample(1:nrow(dat.ros), size = 9, replace = TRUE)
+dat.weather %>% 
+  filter(lineid %in% sample.ids) %>% 
+  ggplot()+
+  geom_histogram(aes(x=wind))+
+  facet_wrap(~lineid)
+
+
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### Example 1
+
+Page 26 of workshop PDF.
+
+You are told: "The windspeed is between 5 and 25 minutes"
+
+A Stan model that represents this statement...
+
+```{r}
+
+model_code_1 <- "
+parameters {
+  real<lower=5, upper=6> windspeed;
+  real<lower=1, upper=600>  temperature;
+}
+"
+
+```
+
+
+Even though this is a minimal model, we can compile it and derive posterior samples of the single parameter...
+
+```{r}
+
+# Write the model code to file
+f <- write_stan_file(model_code_1, dir = MODEL_DIR, basename = "model_1")
+
+# Compile the model (takes a minute)
+model_1 <- cmdstan_model(f)
+
+# Sample the model (this will be fast!)
+samples_1 <- model_1$sample(
+  data = list(),
+  seed = 123,
+  chains = 4,
+  parallel_chains = 4,
+  refresh = 0
+)
+
+```
+
+
+Inspect the samples.
+
+```{r}
+
+samples_1$summary()
+post <- posterior::as_draws_df( samples_1$draws() )
+plot(post$windspeed, xlab="sample", ylab="windspeed")
+plot(density(post$temperature, adj=0.1), xlab="value", main="")
+
+```
+
+
+
+### Example 2
+
+Page 34 of workshop PDF.
+
+Lets say average wind speed is 9 kmh
+
+A Stan model that represents this statement...
+
+```{r}
+
+model_code_2 <- "
+parameters {
+  real<lower=0, upper=20> windspeed;
+}
+model {
+  windspeed ~ normal(10,2);
+}
+"
+
+```
+
+
+This time we will just use the helper function (defined at the top of this document) to compile and sample from the model.
+
+```{r}
+
+post2 <- get_samples(model_code_2)
+
+```
+
+
+
+```{r}
+
+mu <- mean(post2$windspeed) |> round(2)
+q90 <- quantile(post2$windspeed, c(0.05, 0.95)) |> round(2)
+
+plot(density(post2$windspeed, from=0, adj = 0.1), 
+     main = sprintf("Mean windspeed: %g\n90%% range: %g - %g", mu, q90[1], q90[2]), 
+     xlab = "Windspeed")
+
+```
+
+
+
+### Example 3
+
+
+
+You are given some data for observed wind speed and asked to estimate the average.
+
+A Stan model for this task...
+
+
+```{r}
+
+model_code_3 <- "
+data {
+  int N;  // number of observations
+  array[N] real<lower=0> y;  // observed values
+}
+parameters {
+  // Unknown average value of windspeed
+  real<lower=0.0001> avg_windspeed;
+}
+model {
+  // Relate the observed values to the unknown (to be estimated)
+  // average windspeed
+  // Each value of y is assumed to come from this distribution
+  y ~ exponential(1.0 / avg_windspeed);
+}
+"
+
+```
+
+
+
+```{r}
+dat.test <- dat.weather %>% 
+  filter(lineid <=10)
+
+N=nrow(dat.test)
+y=dat.test$wind
+
+
+post3 <- get_samples(
+  model_code_3,
+  data=list(N=N, y=y)
+)
+
+```
+
+```{r}
+
+mu <- round(mean(post3$avg_windspeed), digits = 2)
+q <- round(quantile(post3$avg_windspeed, c(0.05, 0.95)), digits = 2)
+
+plot(density(post3$avg_windspeed, from=0, adj = 0.1), 
+     main = sprintf("Average windspeed: unknown quanity - mean estimate: %g\n90%% range: %g - %g", 
+                    mu, q[1], q[2]), 
+     xlab = "Windspeed")
+
+#add sample (data) mean
+abline(v=mean(dat.test$wind))
+```
+
+
+
+### Example 4
+
+You are given some data for windspeed observed at separate fire spread lines and asked to estimate the average for each location.
+
+A Stan model for this task...
+
+```{r}
+
+model_code_4 <- "
+data {
+  int N;  // total number of observations
+  int M;  // number of spread lines
+  array[N] real<lower=0> windspeed;  // observed values
+  array[N] real<lower=0> rh;  // observed values
+  array[N] int x;  // location index (from 1) for each observation
+}
+parameters {
+  // Unknown average value of waiting time at each location
+  //Declare types, dimensions and constraints
+  array[M] real<lower=0> avg_windspeed;
+  array[M] real<lower=0> avg_rh;
+}
+model {
+  // Relate the observed values to the unknown (to be estimated)
+  // average duration. 
+  // Note how we don't need an explicit loop here although we could do that 
+  // for clarity at the expense of slightly longer computation time.
+  // Also note that if we did 1.0/avg_windspeed[x] this would provoke an error
+  // from Stan which is very picky about vector lengths etc.
+  //
+  windspeed ~ exponential(avg_windspeed[x]^(-1));
+  rh ~ exponential(avg_rh[x]^(-1));
+}
+"
+
+```
+
+
+Define the data.
+
+```{r}
+dat.test <- dat.weather %>% 
+  filter(lineid <=10) %>% 
+  #give new lineid to ensure lineids start at 1
+  mutate(newlineid=dense_rank(lineid))
+
+
+N <- nrow(dat.test)
+
+# spread line indices
+x <- dat.test$newlineid
+
+#Number of locations
+M=n_distinct(dat.test$newlineid)
+
+#wind speeds
+y=dat.test$wind
+rh=dat.test$rh
+
+
+post4 <- get_samples(
+  model_code_4,
+  data = list(N=N, M=M, x=x, windspeed=y,rh=rh)
+)
+
+
+```
+
+
+
+
+```{r}
+
+# The `avg_....` elements in the `post4` object will be matrices with same N columns as unique lineids
+# where each column has samples for a given line.
+
+dat_gg <- as.data.frame(post4) %>% 
+  select(-lp__) %>% 
+  tidyr::pivot_longer(everything())
+
+dat.sample.mean <- dat.test %>% 
+  group_by(newlineid) %>% 
+  summarise(avg_windspeed=mean(wind),avg_rh=mean(rh)) %>% 
+  tidyr::pivot_longer(matches("avg")) %>% 
+  mutate(name=paste0(name,".",newlineid))
+
+ggplot(dat_gg, aes(x = value, colour = name)) +
+  geom_density(linewidth = 1)+
+  geom_vline(data=dat.sample.mean,aes(xintercept = value))+
+  lims(x=c(0,50))+
+  facet_wrap(~name)
+
+```
+
+
+### regression
+a regression using summary weather values
+```{r}
+dat.test.2 <- dat.weather %>% 
+  filter(diff_start_hour > -2) %>% 
+  select(-diff_start_hour) %>% 
+  group_by(lineid) %>% 
+  summarise(mean_rh=mean(rh),mean_wind=mean(wind)) %>% 
+  left_join(dat.ros)
+
+
+
+```
+
+
+```{r}
+
+model_code_5 <- "
+data {
+  int<lower=0> N;   // number of data items/observations
+  vector[N] wnd;           // first predictor - wind
+  vector[N] rh;           // second predictor - relative humidity
+  vector[N] ros;      // outcome - rate of spread
+}
+parameters {
+  real alpha;           // intercept - could define weakly informative priors in model block
+  real beta_wnd;       // coefficients for predictors
+  real beta_rh;       // coefficients for predictors
+  real<lower=0> sigma;  // error scale
+}
+model {
+    ros ~ normal(alpha + beta_wnd * wnd + beta_rh * rh, sigma);  // likelihood. Assuming normal distrubtion for now, but this will need to change
+}"
+
+
+post5 <- get_samples(
+  model_code_5,
+  data = list(N=nrow(dat.test.2), 
+              K=2,
+              ros=dat.test.2$ros,
+              wnd=dat.test.2$mean_wind,
+              rh=dat.test.2$mean_rh)
+)
+```
+
+
+```{r}
+dat_gg <- as.data.frame(post5) %>% 
+  select(-lp__) 
+
+
+dat_gg %>% 
+  tidyr::pivot_longer(everything()) %>% 
+  ggplot(aes(x = value, colour = name)) +
+  geom_density(linewidth = 1)+
+  #lims(x=c(0,50))+
+  facet_wrap(~name)
+```
+
+```{r}
+#Create a grid of predictor values
+wind_seq <- seq(0, 100, length.out = 100)
+rh_mean <- mean(dat.test.2$mean_rh)
+
+
+draws <- as.data.frame(post5)
+# Get posterior mean estimates
+beta_wnd <- draws$beta_wnd
+beta_rh <- draws$beta_rh
+alpha <- draws$alpha
+
+
+
+#Generate posterior predictions for wind effect
+
+# Use 100 draws for plotting, for speed
+set.seed(123)
+draw_idx <- sample(1:nrow(draws), 100)
+
+pred_df <- expand.grid(
+  wind = wind_seq,
+  draw = draw_idx
+) %>%
+  mutate(
+    alpha = alpha[draw],
+    beta_wnd = beta_wnd[draw],
+    beta_rh = beta_rh[draw],
+    pred = alpha + beta_wnd * wind + beta_rh * rh_mean
+  )
+
+
+
+
+
+#Summarise the effect
+library(tidyr)
+
+pred_summary <- pred_df %>%
+  group_by(wind) %>%
+  summarise(
+    mean = mean(pred),
+    lower = quantile(pred, 0.05),
+    upper = quantile(pred, 0.95)
+  )
+
+#plot
+ggplot(pred_summary, aes(x = wind, y = mean)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  labs(
+    x = "Wind Speed",
+    y = "Predicted ROS",
+    title = "Marginal Effect of Wind on ROS (RH fixed at mean)"
+  )
+
+```
+
+
+

@@ -1,0 +1,134 @@
+---
+title: "Bayesian ROS model example"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(here)
+
+library(cmdstanr)
+library(posterior)
+
+library(tidybayes)
+library(ggplot2)
+theme_set( theme_bw() )
+
+MODEL_DIR <- here("stan_models")
+if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
+
+```
+
+
+## Helper code
+
+A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+
+```{r}
+
+get_samples <- function(model_code, data=list(), 
+                        model_dir = MODEL_DIR, 
+                        model_basename = NULL,
+                        seed=123, chains=4) {
+  
+  if (is.null(model_basename)) {
+    model_basename <- deparse(substitute(model_code))
+    
+    # remove '_code' from the base name if present
+    model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+  }
+  
+  f <- write_stan_file(model_code, 
+                       dir = model_dir, 
+                       basename = model_basename)
+  
+  model_x <- cmdstan_model(f)
+  samples_1 <- model_x$sample(
+    data = data,
+    seed = seed,
+    chains = chains,
+    parallel_chains = chains,
+    refresh = 0
+  )
+  pr <- as_draws_rvars( samples_1$draws() )
+  p <- list()
+  for ( i in 1:length(pr) )
+    p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+  return(p)
+}
+
+```
+
+### the data
+
+```{r}
+
+#load 10 spread lines
+dat.ros <- readRDS(here("example\\dat.ros.rds"))
+
+#load hourly weather for the 10 spread lines. "lineid" can be used to link weather to spread line
+dat.weather <- readRDS(here("example\\dat.weather.rds"))
+
+#summarise weather prior to model as first test.
+dat.weather.mean <- dat.weather %>% 
+  group_by(lineid) %>% 
+  summarise(wind_mean=mean(wind),
+            rh_mean=mean(rh))
+
+
+glimpse(dat.ros)
+glimpse(dat.weather.mean)
+glimpse(dat.weather)
+
+```
+
+
+### the model
+This model is fitted based of mean sampled weather.
+Assuming ros is from normal distribution for simplicity for the moment - the actual results don't matter yet, just learning the stan model structure.
+```{r}
+
+model_code <- "
+data {
+  int<lower=0> N;   // number observations
+  vector[N] wnd;           // first predictor - wind
+  vector[N] rh;           // second predictor - relative humidity
+  vector[N] ros;      // outcome - rate of spread
+}
+parameters {
+  real alpha;           // intercept - No specific priors defined but I could define weakly informative priors in model block
+  real beta_wnd;       // coefficients for predictors
+  real beta_rh;       // coefficients for predictors
+  real<lower=0> sigma;  // error scale
+}
+model {
+    ros ~ normal(alpha + beta_wnd * wnd + beta_rh * rh, sigma);  // likelihood. Assuming normal distrubtion for now, but this will need to change
+}"
+
+# compile and sample
+post <- get_samples(
+  model_code,
+  data = list(N=nrow(dat.ros), 
+              ros=dat.ros$ros,
+              wnd=dat.weather.mean$wind_mean,
+              rh=dat.weather.mean$rh_mean)
+)
+```
+plot the coefficients
+these won't be very good - N ROS = 10
+```{r}
+dat_gg <- as.data.frame(post) %>% 
+  select(-lp__) 
+
+
+dat_gg %>% 
+  tidyr::pivot_longer(everything()) %>% 
+  ggplot(aes(x = value, colour = name)) +
+  geom_density(linewidth = 1)+
+  #lims(x=c(0,50))+
+  facet_wrap(~name,scales = "free")
+
+```
+
