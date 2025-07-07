@@ -7,6 +7,7 @@ output: github_document
 knitr::opts_chunk$set(echo = TRUE)
 
 library(dplyr)
+library(stringr)
 library(here)
 
 library(cmdstanr)
@@ -34,7 +35,8 @@ A utility function for sampling from cmdstanr models. This was provided in Richa
 get_samples <- function(model_code, data=list(), 
                         model_dir = MODEL_DIR, 
                         model_basename = NULL,
-                        seed=123, chains=4) {
+                        seed=123, chains=4, refresh = 0,
+                        vars = NULL) {
   
   if (is.null(model_basename)) {
     model_basename <- deparse(substitute(model_code))
@@ -53,9 +55,16 @@ get_samples <- function(model_code, data=list(),
     seed = seed,
     chains = chains,
     parallel_chains = chains,
-    refresh = 0
+    refresh = refresh
   )
-  pr <- as_draws_rvars( samples_1$draws() )
+  
+  if (is.null(vars)) {
+    # Get all variables from the fitted model
+    pr <- as_draws_rvars( samples_1$draws() )
+  } else {
+    # Get specified variables
+    pr <- as_draws_rvars( samples_1$draws(variables = vars))
+  }
   p <- list()
   for ( i in 1:length(pr) )
     p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
@@ -136,7 +145,7 @@ dat.weather %>%
 
 Page 26 of workshop PDF.
 
-You are told: "The windspeed is between 5 and 25 minutes"
+You are told: "The windspeed is between 5 and 25 km/h, and temperature is between 20 and 40 degrees"
 
 A Stan model that represents this statement...
 
@@ -144,8 +153,8 @@ A Stan model that represents this statement...
 
 model_code_1 <- "
 parameters {
-  real<lower=5, upper=6> windspeed;
-  real<lower=1, upper=600>  temperature;
+  real<lower=5, upper=25> windspeed;
+  real<lower=20, upper=40>  temperature;
 }
 "
 
@@ -181,19 +190,18 @@ Inspect the samples.
 samples_1$summary()
 post <- posterior::as_draws_df( samples_1$draws() )
 plot(post$windspeed, xlab="sample", ylab="windspeed")
-plot(density(post$temperature, adj=0.1), xlab="value", main="")
+hist(post$temperature, xlab="temperature", ylab="density", breaks = 20)
 
 ```
 
+Both of the above graphs show that the temperature and wind speed values have been sampled from uniform distributions over the min and max constraints defined in the model.
 
 
 ### Example 2
 
-Page 34 of workshop PDF.
-
 Lets say average wind speed is 9 kmh
 
-A Stan model that represents this statement...
+A Stan model that represents this statement. We arbitrarily set the standard deviation to 2.0 which should give a central 90% range of approximately 6 - 12 km/h for the sampled values.
 
 ```{r}
 
@@ -202,7 +210,7 @@ parameters {
   real<lower=0, upper=20> windspeed;
 }
 model {
-  windspeed ~ normal(10,2);
+  windspeed ~ normal(9, 2);
 }
 "
 
@@ -224,7 +232,7 @@ post2 <- get_samples(model_code_2)
 mu <- mean(post2$windspeed) |> round(2)
 q90 <- quantile(post2$windspeed, c(0.05, 0.95)) |> round(2)
 
-plot(density(post2$windspeed, from=0, adj = 0.1), 
+plot(density(post2$windspeed, from=0, adj = 1), 
      main = sprintf("Mean windspeed: %g\n90%% range: %g - %g", mu, q90[1], q90[2]), 
      xlab = "Windspeed")
 
@@ -234,9 +242,9 @@ plot(density(post2$windspeed, from=0, adj = 0.1),
 
 ### Example 3
 
-
-
 You are given some data for observed wind speed and asked to estimate the average.
+
+For simplicity we will initially fit a normal distribution to the values.
 
 A Stan model for this task...
 
@@ -250,13 +258,17 @@ data {
 }
 parameters {
   // Unknown average value of windspeed
-  real<lower=0.0001> avg_windspeed;
+  real avg_windspeed;
+  
+  // Unknown standard deviation of the (assumed) normal distribution
+  real<lower=0> sigma;
 }
 model {
   // Relate the observed values to the unknown (to be estimated)
   // average windspeed
   // Each value of y is assumed to come from this distribution
-  y ~ exponential(1.0 / avg_windspeed);
+  sigma ~ exponential(1);
+  y ~ normal(avg_windspeed, sigma);
 }
 "
 
@@ -284,13 +296,15 @@ post3 <- get_samples(
 mu <- round(mean(post3$avg_windspeed), digits = 2)
 q <- round(quantile(post3$avg_windspeed, c(0.05, 0.95)), digits = 2)
 
-plot(density(post3$avg_windspeed, from=0, adj = 0.1), 
-     main = sprintf("Average windspeed: unknown quanity - mean estimate: %g\n90%% range: %g - %g", 
-                    mu, q[1], q[2]), 
-     xlab = "Windspeed")
+dat_gg <- as.data.frame(post3) %>%
+  select(avg_windspeed, sigma) %>%
+  tidyr::pivot_longer(everything(), names_to = "param", values_to = "value")
 
-#add sample (data) mean
-abline(v=mean(dat.test$wind))
+ggplot(dat_gg, aes(x = value)) +
+  geom_density(fill = "grey90") +
+  facet_wrap(~param, scales = "free_x") +
+  labs(title = sprintf("Average windspeed: mean estimate: %g\n90%% range: %g - %g", mu, q[1], q[2]))
+
 ```
 
 
@@ -299,7 +313,8 @@ abline(v=mean(dat.test$wind))
 
 You are given some data for windspeed observed at separate fire spread lines and asked to estimate the average for each location.
 
-A Stan model for this task...
+A Stan model for this task that naively treats the weather values as being drawn from a normal distribution. To make the model a little more interesting we will assume that weather is not independent across the fire spread lines, and express this by assuming that the wind speed values are drawn from normal distributions having a separate mean for each spread line but a common standard deviation (i.e. shrinkage across the lines). 
+
 
 ```{r}
 
@@ -307,57 +322,49 @@ model_code_4 <- "
 data {
   int N;  // total number of observations
   int M;  // number of spread lines
-  array[N] real<lower=0> windspeed;  // observed values
-  array[N] real<lower=0> rh;  // observed values
-  array[N] int x;  // location index (from 1) for each observation
+  array[N] real windspeed;  // observed values
+  array[N] int<lower=1, upper=M> loc;  // spread line index for each observation
 }
 parameters {
-  // Unknown average value of waiting time at each location
-  //Declare types, dimensions and constraints
-  array[M] real<lower=0> avg_windspeed;
-  array[M] real<lower=0> avg_rh;
+  // Average wind speed at each spread line
+  vector[M] mu;
+  
+  // Common standard deviation across all spread lines
+  real<lower=0> sigma;
 }
 model {
-  // Relate the observed values to the unknown (to be estimated)
-  // average duration. 
-  // Note how we don't need an explicit loop here although we could do that 
-  // for clarity at the expense of slightly longer computation time.
-  // Also note that if we did 1.0/avg_windspeed[x] this would provoke an error
-  // from Stan which is very picky about vector lengths etc.
-  //
-  windspeed ~ exponential(avg_windspeed[x]^(-1));
-  rh ~ exponential(avg_rh[x]^(-1));
+  // Prior for the common standard deviation with a mean of 5.0
+  sigma ~ exponential(0.2); 
+  
+  for (i in 1:N) {
+    windspeed[i] ~ normal(mu[loc[i]], sigma);
+  }
 }
 "
 
 ```
 
 
-Define the data.
+Gather the data and fit the model.
 
 ```{r}
 dat.test <- dat.weather %>% 
   filter(lineid <=10) %>% 
   #give new lineid to ensure lineids start at 1
-  mutate(newlineid=dense_rank(lineid))
+  mutate(newlineid = as.integer(factor(lineid)) )
 
 
-N <- nrow(dat.test)
-
-# spread line indices
-x <- dat.test$newlineid
-
-#Number of locations
-M=n_distinct(dat.test$newlineid)
-
-#wind speeds
-y=dat.test$wind
-rh=dat.test$rh
+model4_data <- list(
+  N = nrow(dat.test),
+  M = max(dat.test$newlineid),
+  loc = dat.test$newlineid,
+  windspeed = dat.test$wind
+)
 
 
 post4 <- get_samples(
   model_code_4,
-  data = list(N=N, M=M, x=x, windspeed=y,rh=rh)
+  data = model4_data
 )
 
 
@@ -368,72 +375,363 @@ post4 <- get_samples(
 
 ```{r}
 
-# The `avg_....` elements in the `post4` object will be matrices with same N columns as unique lineids
-# where each column has samples for a given line.
-
 dat_gg <- as.data.frame(post4) %>% 
-  select(-lp__) %>% 
-  tidyr::pivot_longer(everything())
+  select(-lp__) %>%
+  
+  tidyr::pivot_longer(starts_with("mu"), names_to = "line", values_to = "mean_wind") %>%
+  
+  # get the integer line ID from the param names (mu.1, mu.2 etc.) and
+  # format it for facet labels
+  mutate(line = as.integer(str_extract(line, "\\d+") ),
+         line = sprintf("line %02d", line))
 
-dat.sample.mean <- dat.test %>% 
-  group_by(newlineid) %>% 
-  summarise(avg_windspeed=mean(wind),avg_rh=mean(rh)) %>% 
-  tidyr::pivot_longer(matches("avg")) %>% 
-  mutate(name=paste0(name,".",newlineid))
+# Observed data to display as a rug plot in each facet
+dat_gg_observed <- dat.test %>%
+  select(line = newlineid, wind) %>%
+  mutate(line = sprintf("line %02d", line))
 
-ggplot(dat_gg, aes(x = value, colour = name)) +
-  geom_density(linewidth = 1)+
-  geom_vline(data=dat.sample.mean,aes(xintercept = value))+
-  lims(x=c(0,50))+
-  facet_wrap(~name)
+# Empirical mean of the observed wind speed value for each line
+dat_gg_means <- dat_gg_observed %>%
+  group_by(line) %>%
+  summarize(obs_mean = mean(wind))
+
+
+ggplot(dat_gg, aes(x = mean_wind)) +
+  geom_density(fill = "skyblue") +
+  
+  # Observed values
+  geom_rug(data = dat_gg_observed, aes(x = wind), 
+           colour = "blue", size = 1) +
+  
+  # Empirical mean values
+  geom_vline(data = dat_gg_means, aes(xintercept = obs_mean), 
+             colour = "blue", linetype = "dashed") +
+  
+  facet_wrap(~line)
 
 ```
 
+The graph shows that the model has fitted the distribution of mean wind value for each line such that it is centred on the mean of the observed values. 
 
-### regression
-a regression using summary weather values
+
+###Example 4a
+
+Next we do a very similar model but this time for relative humidity (RH) rather than wind speed. RH values are percentages, i.e. bounded values, so its best to honour this by fitting an appropriate distribution. Since percentage values are really just proportions, the beta distribution is an obvious choice. Note that the beta distribution supports values between, but not including, 0 and 1. The data does not contain any RH values of 0% or 100% so we are okay.
+
+A bit of detail...
+
+A beta distribution is commonly described via two parameters, variously called `a` and `b`, or `alpha` and `beta`, or (in R) `shape1` and `shape2`. 
+
+The mean of a beta(a, b) distribution is given by `mu = a / (a+b)`.
+
+Here are some examples of beta distributions that all have a mean of 0.4...
+
 ```{r}
-dat.test.2 <- dat.weather %>% 
-  filter(diff_start_hour > -2) %>% 
-  select(-diff_start_hour) %>% 
-  group_by(lineid) %>% 
-  summarise(mean_rh=mean(rh),mean_wind=mean(wind)) %>% 
-  left_join(dat.ros)
 
+dat <- data.frame(
+  a = c(10, 4, 2, 1.5), 
+  b = c(15, 6, 3, 2.25),
+  clrs <- c("blue", "steelblue", "mediumpurple", "darkred")
+)
+
+for (i in 1:nrow(dat)) {
+  curve(dbeta(x, shape1 = dat$a[i], shape2 = dat$b[i]), 
+        xlab = "Value",
+        ylab = "Density",
+        col = dat$clrs[i], 
+        lwd = 2,
+        add = i>1)
+}
+
+```
+
+
+It is often a bit more convenient to describe a beta distribution more directly in terms of its mean $\mu$ and a dispersion or spread parameter $\phi$. The relationship to the standard beta parameters $\alpha$ and $\beta$ is:
+
+$$
+\alpha = \mu \phi \\
+\beta = (1 - \mu)\phi
+$$
+
+
+In JAGS you would set priors for the mean and dispersion parameter, then calculate the correspond a and b values for the `dbeta(a, b)` distribution. In Stan, things are a little easier since there is a `beta_proportion` distribution that is parameterized directly via the mean and dispersion.
+
+Note: we are being very lazy here and not bothering to define priors for either the mean RH values (`mu`) or the common dispersion parameter (`phi`). Instead we are setting constraints on the range of these parameters and allowing Stan to sample a corresponding uniform distribution for each one.
+
+```{r}
+
+model_code_4a <- "
+data {
+  int N;  // total number of observations
+  int M;  // number of spread lines
+  array[N] real<lower=0, upper=1> rh;  // observed RH values as proportions
+  array[N] int<lower=1, upper=M> loc;  // spread line index for each observation
+}
+parameters {
+  // Average RH value at each spread line
+  array[M] real<lower=0.01, upper=0.9> mu;
+  
+  // Common dispersion parameter for the beta distributions across all spread lines
+  real<lower=0, upper=50> phi;
+}
+model {
+  for (i in 1:N) {
+    rh[i] ~ beta_proportion(mu[loc[i]], phi + 1);
+  }
+}
+"
+
+```
+
+
+Gather the data and fit the model.
+
+```{r}
+
+dat.test <- dat.weather %>% 
+  filter(lineid <=10) %>% 
+  #give new lineid to ensure lineids start at 1
+  mutate(newlineid = as.integer(factor(lineid)) )
+
+
+model4a_data <- list(
+  N = nrow(dat.test),
+  M = max(dat.test$newlineid),
+  loc = dat.test$newlineid,
+  
+  # Express RH values as proportions
+  rh = dat.test$rh / 100  
+)
+
+
+post4a <- get_samples(
+  model_code_4a,
+  data = model4a_data
+)
 
 
 ```
 
+
+```{r}
+
+dat_gg <- as.data.frame(post4a) %>% 
+  select(-lp__) %>%
+  
+  tidyr::pivot_longer(starts_with("mu"), names_to = "line", values_to = "mean_rh") %>%
+  
+  # get the integer line ID from the param names (mu.1, mu.2 etc.) and
+  # format it for facet labels
+  mutate(line = as.integer(str_extract(line, "\\d+") ),
+         line = sprintf("line %02d", line))
+
+# Observed data to display as a rug plot in each facet
+dat_gg_observed <- dat.test %>%
+  select(line = newlineid, rh) %>%
+  mutate(line = sprintf("line %02d", line),
+         rh = rh / 100)
+
+# Empirical mean of the observed RH value for each line
+dat_gg_means <- dat_gg_observed %>%
+  group_by(line) %>%
+  summarize(obs_mean = mean(rh))
+
+
+ggplot(dat_gg, aes(x = mean_rh)) +
+  geom_density(fill = "skyblue") +
+  
+  # Observed values
+  geom_rug(data = dat_gg_observed, aes(x = rh),
+           colour = "blue", size = 1) +
+  
+  # Empirical mean values
+  geom_vline(data = dat_gg_means, aes(xintercept = obs_mean),
+             colour = "blue", linetype = "dashed") +
+  
+  scale_x_continuous(labels = scales::percent) +
+  
+  facet_wrap(~line)
+
+```
+
+Note that, unlike the mean wind speed distributions earlier, not all of these mean RH distributions are centred on the empirical mean value for the respective fire spread line, but most of them are and the others are pretty close. This happens because the beta distributions fitted to the RH values will be a little right-skewed.
+
+
+### Basic regression model relating rate of spread to wind speed and RH
+
+This is a very simplified model of ROS values in relation to wind speed and RH. Its purpose is to experiment with different ways of handling the data where there is a single ROS value but multiple weather values for each fire spread line. 
+
+It will probably take 5-10 minutes to fit the model when using the full data set.
+
+
+```{r}
+
+# Weather data for fire spread lines
+dat <- dat.weather %>%
+  filter(diff_start_hour > -2)
+
+model5_data <- list(
+  W = nrow(dat),
+  L = max(dat$lineid),
+  wline_id = dat$lineid,  # line ID for weather observations
+  wind = dat$wind,
+  rh = dat$rh / 100
+)
+
+# Rate of spread values for lines
+model5_data <- c(model5_data, 
+                 list(ros_line_id = dat.ros$lineid, ros = dat.ros$ros))
+
+# Check that the weather line IDs and the ROS line IDs line up properly
+MaxLineID <- max(model5_data$wline_id)
+
+# Check there are no gaps in the line IDs
+stopifnot( all(model5_data$wline_id %in% seq_len(MaxLineID)) )
+  
+# Check that all weather line IDs are in the ROS line IDs and vice versa
+stopifnot( length(symdiff(model5_data$wline_id, model5_data$ros_line_id)) == 0)
+
+```
+
+
+Fit the model. Note - this will probably take 5-10 minutes.
 
 ```{r}
 
 model_code_5 <- "
 data {
-  int<lower=0> N;   // number of data items/observations
-  vector[N] wnd;           // first predictor - wind
-  vector[N] rh;           // second predictor - relative humidity
-  vector[N] ros;      // outcome - rate of spread
+  int<lower=1> W;     // number of weather observations
+  int<lower=1> L;     // number of fire spread lines
+  
+  array[W] int<lower=1> wline_id;  // line ID for each weather observation
+  vector<lower=0>[W] wind;         // wind speed values
+  vector<lower=0>[W] rh;      // relative humidity values expressed as proportions
+  vector<lower=0>[L] ros;   // outcome - rate of spread
+}
+transformed data {
+  vector[L] ros_log = log(ros);
 }
 parameters {
+  vector[L] avg_wind;  // imputed wind value for each spread line
+  real<lower=0> sigma_wind;
+  
+  vector<lower=0.01, upper=0.9>[L] avg_rh;    // imputed relative humidity value for each line
+  real<lower=0, upper=50> phi_rh;
+  
   real alpha;           // intercept - could define weakly informative priors in model block
-  real beta_wnd;       // coefficients for predictors
+  real beta_wind;       // coefficients for predictors
   real beta_rh;       // coefficients for predictors
-  real<lower=0> sigma;  // error scale
+  real<lower=0> sigma_ros;  // error scale
 }
 model {
-    ros ~ normal(alpha + beta_wnd * wnd + beta_rh * rh, sigma);  // likelihood. Assuming normal distrubtion for now, but this will need to change
+  vector[L] mu;        // linear predictor value for ROS for each line
+  
+  for (i in 1:W) {
+    wind[i] ~ normal(avg_wind[wline_id[i]], sigma_wind);
+    rh[i] ~ beta_proportion(avg_rh[wline_id[i]], phi_rh + 1);
+  }
+  
+  for (i in 1:L) {
+    mu[i] = alpha + beta_wind * avg_wind[i] + beta_rh * avg_rh[i];
+    ros_log[i] ~ normal(mu[i], sigma_ros);
+  }
 }"
 
+```
+
+
+Fit the model and just retrieve the posterior samples for the parameters that we need, i.e. the regression coefficients and not the many imputed values for wind and RH.
+
+Note: You can safely ignore one or two warnings about rejected samples.
+
+```{r}
 
 post5 <- get_samples(
   model_code_5,
-  data = list(N=nrow(dat.test.2), 
-              K=2,
-              ros=dat.test.2$ros,
-              wnd=dat.test.2$mean_wind,
-              rh=dat.test.2$mean_rh)
+  data = model5_data,
+  vars = c("alpha", "beta_wind", "beta_rh", "sigma_ros"),
+  refresh = 100
 )
+
 ```
+
+
+
+```{r}
+
+dat_post5 <- as.data.frame(post5)
+
+# Wind and RH values for predictions
+dat_pred <- expand.grid(
+  wind = c(10, 20, 30, 40),
+  rh = c(20, 50, 80) / 100
+)
+
+
+ros_pred <- dat_post5 %>%
+  # Add prediction data to every posterior record
+  cross_join(dat_pred) %>%
+  
+  # Predict ROS values
+  mutate(mu = alpha + beta_wind * wind + beta_rh * rh,
+         ros_log = rnorm(n(), mu, sigma_ros),
+         ros = exp(ros_log)) %>%
+  
+  # Summary statistics
+  group_by(wind, rh) %>%
+  summarize(lwr90 = quantile(ros, 0.05),
+            lwr50 = quantile(ros, 0.25),
+            mid = quantile(ros, 0.5),
+            upr50 = quantile(ros, 0.75),
+            upr90 = quantile(ros, 0.95) )
+
+```
+
+
+Take a look at the predictions...
+
+```{r}
+
+dodgew <- 5
+
+dat_gg <- ros_pred %>%
+  mutate(frh = factor(paste0(rh * 100, "%")))
+
+
+dat_obs <- dat.weather %>%
+  filter(diff_start_hour > -2) %>%
+  group_by(lineid) %>%
+  summarize(wind = mean(wind), rh = mean(rh)) %>%
+  
+  left_join(dat.ros %>% select(lineid, ros), by = "lineid")
+
+
+ggplot(data = dat_gg, aes(x = wind)) +
+  
+  # Plot points for observed ROS values vs mean wind speed, just for
+  # visual comparison to the predicted ROS ranges
+  geom_point(data = dat_obs, aes(x = wind, y = ros), alpha = 0.1) +
+
+  
+  geom_linerange(aes(ymin = lwr90, ymax = upr90, colour = frh),
+                 position = position_dodge(width = dodgew),
+                 linewidth = 1) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = frh),
+                 position = position_dodge(width = dodgew),
+                 linewidth = 2.5, size = 1.5) +
+  
+  labs(colour = "Relative humidity",
+       x = "Wind speed (km/h)",
+       y = "Predicted ROS")  
+
+```
+
+
+
+
+
+## Michael's earlier code from this point on...
 
 
 ```{r}
