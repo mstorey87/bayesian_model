@@ -58,13 +58,13 @@ get_samples <- function(model_code, data=list(),
     parallel_chains = chains,
     refresh = refresh
   )
-<<<<<<< HEAD
+
   # pr <- as_draws_rvars( samples_1$draws() )
   # p <- list()
   # for ( i in 1:length(pr) )
   #   p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
   return(samples_1)
-=======
+
   
   if (is.null(vars)) {
     # Get all variables from the fitted model
@@ -77,7 +77,7 @@ get_samples <- function(model_code, data=list(),
   for ( i in 1:length(pr) )
     p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
   return(p)
->>>>>>> 5e1d78bf2c0e2bdbd36d4aa3449d0476351cfae0
+
 }
 
 ```
