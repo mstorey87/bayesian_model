@@ -1,9 +1,9 @@
 
 data {
   int<lower=0> N;   // number of data items/observations
-  vector[N] wnd;           // first predictor
-  vector[N] rh;           // second predictor
-  vector[N] ros;      // outcome vector
+  vector[N] wnd;           // first predictor - wind
+  vector[N] rh;           // second predictor - relative humidity
+  vector[N] ros;      // outcome - rate of spread
 }
 parameters {
   real alpha;           // intercept - could define weakly informative priors in model block
@@ -12,5 +12,5 @@ parameters {
   real<lower=0> sigma;  // error scale
 }
 model {
-    ros ~ normal(alpha + beta_wnd * wnd + beta_rh * rh, sigma);  // likelihood
+    ros ~ normal(alpha + beta_wnd * wnd + beta_rh * rh, sigma);  // likelihood. Assuming normal distrubtion for now, but this will need to change
 }

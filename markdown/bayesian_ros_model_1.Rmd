@@ -28,6 +28,7 @@ This doc loads ROS and weather data, and then builds a Bayesian ROS model step b
 ## Helper code
 
 A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+Also now just returns samples_1
 
 ```{r}
 
@@ -55,11 +56,11 @@ get_samples <- function(model_code, data=list(),
     parallel_chains = chains,
     refresh = 0
   )
-  pr <- as_draws_rvars( samples_1$draws() )
-  p <- list()
-  for ( i in 1:length(pr) )
-    p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
-  return(p)
+  # pr <- as_draws_rvars( samples_1$draws() )
+  # p <- list()
+  # for ( i in 1:length(pr) )
+  #   p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+  return(samples_1)
 }
 
 ```
@@ -450,38 +451,18 @@ dat_gg %>%
 ```
 
 ```{r}
-#Create a grid of predictor values
-wind_seq <- seq(0, 100, length.out = 100)
-rh_mean <- mean(dat.test.2$mean_rh)
-
-
-draws <- as.data.frame(post5)
-# Get posterior mean estimates
-beta_wnd <- draws$beta_wnd
-beta_rh <- draws$beta_rh
-alpha <- draws$alpha
-
-
-
+draws <- post5$draws(format="df")
 #Generate posterior predictions for wind effect
 
-# Use 100 draws for plotting, for speed
-set.seed(123)
-draw_idx <- sample(1:nrow(draws), 100)
+pred_grid <- dat.test.2 %>% 
+  select(wind=mean_wind,mean_rh) %>% 
+  marginaleffects::datagrid(newdata=.,wind=seq(0,50))
 
-pred_df <- expand.grid(
-  wind = wind_seq,
-  draw = draw_idx
-) %>%
+pred_df <- pred_grid %>% 
+  crossing(draws) %>% 
   mutate(
-    alpha = alpha[draw],
-    beta_wnd = beta_wnd[draw],
-    beta_rh = beta_rh[draw],
-    pred = alpha + beta_wnd * wind + beta_rh * rh_mean
+    pred = alpha + beta_wnd * wind + beta_rh * mean_rh
   )
-
-
-
 
 
 #Summarise the effect
@@ -508,4 +489,41 @@ ggplot(pred_summary, aes(x = wind, y = mean)) +
 ```
 
 
+```{r}
+draws <- post5$draws(format="df")
+#Generate posterior predictions for wind effect
+
+pred_grid <- dat.test.2 %>% 
+  select(mean_wind,rh=mean_rh) %>% 
+  marginaleffects::datagrid(newdata=.,rh=seq(0,100))
+
+pred_df <- pred_grid %>% 
+  crossing(draws) %>% 
+  mutate(
+    pred = alpha + beta_wnd * mean_wind + beta_rh * rh
+  )
+
+
+#Summarise the effect
+library(tidyr)
+
+pred_summary <- pred_df %>%
+  group_by(rh) %>%
+  summarise(
+    mean = mean(pred),
+    lower = quantile(pred, 0.05),
+    upper = quantile(pred, 0.95)
+  )
+
+#plot
+ggplot(pred_summary, aes(x = rh, y = mean)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  labs(
+    x = "RH",
+    y = "Predicted ROS",
+    title = "Marginal Effect of RH on ROS (wind fixed at mean)"
+  )
+
+```
 
