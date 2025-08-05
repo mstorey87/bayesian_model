@@ -1,0 +1,527 @@
+---
+title: "ROS - FFDI sigmoid model using JAGS"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(sf)
+library(stringr)
+
+library(runjags)
+
+runjags.options(modules = "glm")
+
+theme_set( theme_bw() )
+
+
+##### Helper functions 
+
+# Read sf data from a CSV file. This is to get round some
+# pesky problems when using st_read directly (numeric vars
+# converted to factors; WKT column not removed)
+fn_read <- function(x) {
+  dat <- read.csv(x, stringsAsFactors = FALSE)
+  dat <- sf::st_as_sf(dat, crs = 3112, wkt = "WKT", remove = TRUE)
+  rename(dat, geometry = WKT)
+}
+
+set.seed(42)
+
+```
+
+
+## Data
+
+### Spread lines
+
+```{r}
+
+path <- here("data_raw", "max_spread_lines_60_min.csv")
+
+dat.lines.sf <- fn_read(path) %>%
+
+  mutate(start_DTUTC = as.POSIXct(start_DTUTC, tz = "UTC"),
+         end_DTUTC = as.POSIXct(end_DTUTC, tz = "UTC")) %>%
+
+  # Add an integer line id
+  mutate(lineid = row_number()) %>%
+  
+  # Add an integer fire/day id to use for random effect index
+  # (this this should probably be just on fire name - MB)
+  mutate(groupseqid = as.integer(factor(group_id)))
+
+
+# Split into spatial and non-spatial data frames
+dat.lines <- st_drop_geometry(dat.lines.sf)
+
+dat.lines.sf <- dat.lines.sf %>%
+  select(lineid, geometry)
+
+```
+
+
+### Weather variables
+
+For each lineid (from dat.lines), there are multiple weather observations (each hour during progression and multiple BARRA weather grid pixels for each hour)
+
+```{r eval=FALSE, include=FALSE}
+
+path <- here("data_raw", "weather_60_min_100km.csv")
+
+dat.weather.load<-data.table::fread(path,
+                               select = c('NAME2',
+                                          'group_id',
+                                          'barra_dt_posix_adj',
+                                          'sample_dist',
+                                          'ffdi_barra',
+                                          'wnd_kmh_10m',
+                                          'relhum_sfc',
+                                          'av_wndgust10m_kmh',
+                                          'HDWI_50_nr',
+                                           'vpd_max_50_nr',
+                                           'ws_max_50_nr',
+                                           'rain45',
+                                           'soil_mois_lv1',
+                                           'av_temp_scrn'))
+
+```
+
+```{r}
+
+dat.weather <- dat.weather.load %>% 
+  
+  filter(sample_dist < 50000)%>%
+  select(NAME2,DTUTC_rnd=barra_dt_posix_adj,ffdi_barra,relhum_sfc,av_wndgust10m_kmh,
+         ws_max_50_nr,vpd_max_50_nr,HDWI_50_nr,rain45,soil_mois_lv1) %>% 
+  mutate(DTUTC = as.POSIXct(DTUTC_rnd, tz = "UTC",format="%Y-%m-%dT%H:%M")) 
+
+# Tag values that are during, or within one hour of, the time interval for the 
+# respective spread line
+time.tol <- lubridate::minutes(120)
+
+dat <- dat.lines %>%
+  mutate(t0 = start_DTUTC - time.tol, 
+         t1 = end_DTUTC + lubridate::minutes(60)) %>%
+  
+  select(NAME2, t0, t1)
+
+
+dat.weather <- dat.weather %>%
+  left_join(dat, by = "NAME2") %>%
+
+  mutate(during_line = DTUTC >= t0 & DTUTC <= t1) %>%
+  select(-t0, -t1) %>% 
+  filter(as.logical(during_line)) %>%
+  select(-during_line,-DTUTC_rnd) %>% 
+  
+  #summarize to spatial max
+  group_by(NAME2,DTUTC) %>% 
+  summarise_all(max) %>% 
+  data.frame() %>% 
+  
+  mutate(HDWI_50_nr=HDWI_50_nr/10)
+
+
+```
+
+
+```{r}
+dat.lines <- dat.lines %>% 
+  filter(NAME2 %in% dat.weather$NAME2)%>%
+
+  # Add an integer line id
+  mutate(lineid = row_number()) %>%
+  
+  # Add an integer fire/day id to use for random effect index
+  # (this this should probably be just on fire name - MB)
+  mutate(groupseqid = as.integer(factor(group_id)))
+```
+
+##### Page Break
+
+
+
+## Model ROS in relation to FFDI
+
+This model tests the idea of fitting a sigmoid function for ROS in relation to FFDI. The model also includes a random effect term, currently based on fire and day but should probably be just fire (?) to account for repeat sampling of fires.
+
+### JAGS model code
+
+```{r}
+
+model.sigmoid.code <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dgamma(phi.X1[lineid[i]] * mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dgamma(phi.X2[lineid[i]] * mu.X2[lineid[i]], phi.X2[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dgamma(5, 0.025)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dgamma(5, 0.25)
+    phi.X2[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1 * mu.X1[i] + b2 * mu.X2[i] + z[groupseqid[i]]
+    
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-log(dgamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS))
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+```
+
+
+### Model data
+
+The data include an *a-priori* value for maximum possible ROS. The pragmatic reason for this is that it is hard to learn such a value from the data because there will always (?) be very few samples near the maximum observed ROS. 
+
+An alternative to an a-priori value is to constrain the model to learn a maximum ROS value that can be no smaller than the largest observed value by setting a prior for the difference between this and the maximum possible. However, that still leaves you with the need to choose (and justify) such a prior. Either approach could be based on prior studies or expert opinion - perhaps your own!
+
+
+```{r}
+
+# A-priori value (plucked out of thin air) for maximum possible rate of spread
+ROS.MAX <- 12
+
+dat.join <- dat.weather %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = HDWI_50_nr , X2 = rain45) %>%
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+
+model.sigmoid.data <- c(as.list(dat.join), 
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+```
+
+
+### Fit the model with JAGS
+
+The code below fits four MCMC chains in parallel, thinning to every 20th sample to deal with serial auto-correlation. If you have more processors you could double the `n.chains` value and halve the `sample` value to speed it up. 
+
+```{r}
+
+model.sigmoid <- run.jags(model.sigmoid.code,
+                         monitor = c("b0", "b1","b2", "phi.ROS", "z.sd","LogLik"),
+                         data = model.sigmoid.data, 
+                         n.chains = 4, 
+                         burnin = 1000, 
+                         sample = 1000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = -0.1,
+                             b2 = -0.1,
+                             phi.ROS = 1
+                           )
+                         })
+
+#dic.model.sigmoid <- extract(model.sigmoid,"DIC")
+
+LogLik.model.sigmoid <- do.call(rbind, model.sigmoid$mcmc)
+LogLik.model.sigmoid <- LogLik.model.sigmoid[,str_detect(colnames(LogLik.model.sigmoid),"LogLik")]
+waic.model.sigmoid <- loo::waic(LogLik.model.sigmoid)
+loo.model.sigmoid <- loo::loo(LogLik.model.sigmoid)
+
+```
+
+
+plot(model.sigmoid, vars = c("b0", "b1", "phi.ROS",
+                             "mu.X1[1]", "mu.X1[8]", "mu.X1[64]"))
+
+summary(model.sigmoid, vars = c("b0", "b1", "phi.ROS",
+                                "mu.X1[1]", "mu.X1[8]", "mu.X1[64]"))
+
+```{r}
+
+plot(model.sigmoid,vars = c("b0", "b1","b2", "phi.ROS"))
+
+```
+
+```{r}
+
+summary(model.sigmoid,vars = c("b0", "b1","b2", "phi.ROS"))
+
+```
+
+
+### Model predictions
+
+Predict ROS values for a regular sequence of FFDI values, and calculate median and bounds of the predictions.
+
+```{r}
+
+# Combine posterior samples for all chains into a simple matrix
+post <- do.call(rbind, model.sigmoid$mcmc)
+
+# We only need the b0 and b1 parameters for prediction
+post <- post[, c("b0", "b1","b2")]
+
+# Prediction function
+fn_predict <- function(x1,x2, b0, b1,b2) { 
+  lp <- b0 + b1*x1+ b2*x2
+  ROS.MAX / (1 + exp(lp))
+}
+
+# Evenly spaced sequence of FFDI values for prediction
+pX1 <- seq(0, max(model.sigmoid.data$X1), length.out = 50)
+pX2 <- 50
+
+#actual data
+#pX1 <- model.sigmoid.data$X1
+#pX2 <- model.sigmoid.data$X2
+
+# For each row of the posterior matrix, predict ROS for 
+# each pX1 value
+pdat <- apply(post, 1, function(params) {
+  fn_predict(pX1, pX2,params[1], params[2],params[3])
+})
+
+# pdat will have a row for each input FFDI value, and a column
+# for each posterior sample. Now, for each row, calculate
+# summary statistics (median and quantiles)
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975))
+})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+pdat.stats$x1 <- pX1
+
+
+
+# For comparison, plot points for ROS vs mean FFDI for each line
+dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+  group_by(lineid) %>%
+  summarize(x1 = mean(X1)) %>%
+  left_join(dat.ros, by = "lineid")
+  
+
+ggplot(data = pdat.stats, aes(x = x1)) +
+  geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  geom_line(aes(y = mid)) +
+  
+  geom_point(data = dat.obs, aes(y = ROS),
+             size = 2, alpha = 0.3) +
+  
+  labs(x = "x1", y = "Predicted ROS")
+  
+
+```
+
+
+```{r}
+dat.resids <- cbind(dat.weather,pdat.stats) %>% left_join(dat.lines %>% select(NAME2,ROS)) %>% mutate(resids=ROS-mid)
+
+plot(dat.resids$resids)
+plot(dat.resids$ROS,dat.resids$resids)
+
+var(dat.resids$resids[dat.resids$ROS> 3])
+var(dat.resids$resids[dat.resids$ROS <= 3])
+
+```
+
+
+run a posterior prediction for a value/set of values
+```{r}
+### Calculate posterior predictions for model
+
+#Calculating posterior predictions - this is an example code from datacamp that is adapted for the model above
+#Works by first calculating the mean trend of ROS at 2 selected levels of X1
+#Then sampling from a distribution using the trend and phi0 from MCMC
+
+#ffdi1s_chains <- as.data.frame(as.matrix( ros_ffdi1s.model$mcmc ))[, c("b1","ros.max","slope","linpred.infl","phi.ros0")]
+
+# Combine posterior samples for all chains into a simple matrix
+post <- do.call(rbind, model.sigmoid$mcmc)
+post <- post[, c("b0", "b1","b2","phi.ROS")]
+
+
+
+# Calculate the trend under each Markov chain parameter set
+X1<-100#quantile(model.sigmoid.data$X1,.5)
+X2 <- quantile(model.sigmoid.data$X2,.01,na.rm = TRUE)
+
+dat.pred <- post %>% 
+  data.frame() %>% 
+  mutate(trend = fn_predict(X1,X2,b0,b1,b2)) %>% 
+  mutate(prd_distr=rgamma(nrow(post),phi.ROS*trend,phi.ROS))
+  
+
+# Construct a posterior density plot of the ROS
+ggplot(dat.pred) +
+  geom_density(aes(x = trend),colour='grey') + xlab("ROS kmh") +
+  
+    geom_density(aes(x = prd_distr),colour='red') + xlab("ROS kmh")
+
+    #geom_density(aes(x = ROS_X1high),colour='dark red')   # +xlim(0,15)
+
+```
+
+#predict and test model with a test set
+
+```{r}
+set.seed(99)
+dat.lines.test <- dat.lines %>% filter(row_number() %in% sample(1:nrow(dat.lines),55))
+dat.weather.test <- dat.weather %>% filter(NAME2 %in% dat.lines.test$NAME2)
+
+
+
+# Combine posterior samples for all chains into a simple matrix
+post <- do.call(rbind, model.sigmoid$mcmc)
+
+# We only need the b0 and b1 parameters for prediction
+post <- post[, c("b0", "b1","b2")]
+
+# Prediction function
+fn_predict <- function(x1,x2, b0, b1,b2) { 
+  lp <- b0 + b1*x1+ b2*x2
+  ROS.MAX / (1 + exp(lp))
+}
+
+dat.test <- dat.weather.test %>% select(X1=HDWI_50_nr,X2=rain45,NAME2)
+#actual data
+pX1 <- dat.test$X1
+pX2 <- dat.test$X2
+
+# For each row of the posterior matrix, predict ROS for 
+# each pX1 value
+pdat <- apply(post, 1, function(params) {
+  fn_predict(pX1, pX2,params[1], params[2],params[3])
+})
+
+# pdat will have a row for each input FFDI value, and a column
+# for each posterior sample. Now, for each row, calculate
+# summary statistics (median and quantiles)
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975))
+})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+pdat.stats$x1 <- pX1
+
+
+
+# For comparison, plot points for ROS vs mean FFDI for each line
+dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+  group_by(lineid) %>%
+  summarize(x1 = mean(X1)) %>%
+  left_join(dat.ros, by = "lineid")
+  
+
+ggplot(data = pdat.stats, aes(x = x1)) +
+  geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  geom_line(aes(y = mid)) +
+  
+  geom_point(data = dat.obs, aes(y = ROS),
+             size = 2, alpha = 0.3) +
+  
+  labs(x = "x1", y = "Predicted ROS")
+
+
+##calculate residuals
+dat.resids <- cbind(dat.test,pdat.stats) %>% 
+  left_join(dat.lines.test %>% select(NAME2,ROS)) %>% 
+  mutate(mid_resids=ROS-mid,
+         lwr95_resids=ROS-lwr95,
+         upr95_resids=ROS-upr95) %>% 
+  group_by(NAME2) %>% 
+  summarise_all(mean)
+
+plot(dat.resids$mid_resids)
+plot(dat.resids$ROS,dat.resids$mid_resids)
+
+var(dat.resids$mid_resids[dat.resids$ROS> 4])
+var(dat.resids$mid_resids[dat.resids$ROS <= 4])
+
+
+ggplot(data = dat.resids,aes(x = X1, y = mid_resids)) +
+  geom_point()+
+    geom_segment(aes(x = X1, xend = X1, y = lwr95_resids, yend = upr95_resids, color = "red"))+
+  
+  
+  labs(x = "X1", y = "ROS resids lwr95 to upr 95",
+       title = "Residuals check") 
+
+
+ggplot(data = dat.resids,aes(x = X2, y = mid_resids)) +
+  geom_point()+
+    geom_segment(aes(x = X2, xend = X2, y = lwr95_resids, yend = upr95_resids, color = "red"))+
+  
+  
+  labs(x = "X2", y = "ROS resids lwr95 to upr 95",
+       title = "Residuals check") 
+
+
+
+ggplot(data = dat.resids,aes(x = ROS, y = mid_resids)) +
+  geom_point()+
+    geom_segment(aes(x = ROS, xend = ROS, y = lwr95_resids, yend = upr95_resids, color = "red"))+
+  
+  
+  labs(x = "ROS", y = "ROS resids lwr95 to upr 95",
+       title = "Residuals check") 
+
+
+
+
+```
+
+
+
+
+
+
+### Things to think about
+
+It's nice that the model works, but is it worth the trouble compared to a simpler, non-asymptotic model (Gamma with log link)? The inflection point of the trend line is somewhere around FFDI = 65. Almost all (98%) of the recorded FFDI values (dat.weather) are lower than this value. This means that, for the range of most data values, a simpler model would produce very similar predictions. Only the few observations at higher FFDI values would be markedly different.
+
