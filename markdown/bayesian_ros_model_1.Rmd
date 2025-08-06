@@ -29,47 +29,89 @@ This doc loads ROS and weather data, and then builds a Bayesian ROS model step b
 ## Helper code
 
 A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+Also now just returns samples_1
 
 ```{r}
-
 get_samples <- function(model_code, data=list(), 
                         model_dir = MODEL_DIR, 
                         model_basename = NULL,
-                        seed=123, chains=4, refresh = 0,
-                        vars = NULL) {
+                        seed=123, chains=4) {
   
-  if (is.null(model_basename)) {
-    model_basename <- deparse(substitute(model_code))
+    if (is.null(model_basename)) {
+      model_basename <- deparse(substitute(model_code))
+      
+      # remove '_code' from the base name if present
+      model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+    }
+  
+    f <- write_stan_file(model_code, 
+                         dir = model_dir, 
+                         basename = model_basename)
     
-    # remove '_code' from the base name if present
-    model_basename <- sub(model_basename, pattern = "_code", replacement = "")
-  }
-  
-  f <- write_stan_file(model_code, 
-                       dir = model_dir, 
-                       basename = model_basename)
-  
-  model_x <- cmdstan_model(f)
-  samples_1 <- model_x$sample(
-    data = data,
-    seed = seed,
-    chains = chains,
-    parallel_chains = chains,
-    refresh = refresh
-  )
-  
-  if (is.null(vars)) {
-    # Get all variables from the fitted model
-    pr <- as_draws_rvars( samples_1$draws() )
-  } else {
-    # Get specified variables
-    pr <- as_draws_rvars( samples_1$draws(variables = vars))
-  }
-  p <- list()
-  for ( i in 1:length(pr) )
-    p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
-  return(p)
+    model_x <- cmdstan_model(f)
+    samples_1 <- model_x$sample(
+        data = data,
+        seed = seed,
+        chains = chains,
+        parallel_chains = chains,
+        refresh = 0
+    )
+    
+    return(samples_1)
+    # pr <- as_draws_rvars( samples_1$draws() )
+    # p <- list()
+    # for ( i in 1:length(pr) )
+    #     p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+    # return(p)
 }
+
+# 
+# get_samples <- function(model_code, data=list(), 
+#                         model_dir = MODEL_DIR, 
+#                         model_basename = NULL,
+#                         seed=123, chains=4, refresh = 0,
+#                         vars = NULL) {
+#   
+#   if (is.null(model_basename)) {
+#     model_basename <- deparse(substitute(model_code))
+#     
+#     # remove '_code' from the base name if present
+#     model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+#   }
+#   
+#   f <- write_stan_file(model_code, 
+#                        dir = model_dir, 
+#                        basename = model_basename)
+#   
+#   model_x <- cmdstan_model(f)
+#   samples_1 <- model_x$sample(
+#     data = data,
+#     seed = seed,
+#     chains = chains,
+#     parallel_chains = chains,
+#     refresh = refresh
+#   )
+# 
+#   # pr <- as_draws_rvars( samples_1$draws() )
+#   # p <- list()
+#   # for ( i in 1:length(pr) )
+#   #   p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+#   return(samples_1)
+# 
+#   
+#   if (is.null(vars)) {
+#     # Get all variables from the fitted model
+#     pr <- as_draws_rvars( samples_1$draws() )
+#   } else {
+#     # Get specified variables
+#     pr <- as_draws_rvars( samples_1$draws(variables = vars))
+#   }
+#   p <- list()
+#   for ( i in 1:length(pr) )
+#     p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+#   return(p)
+# 
+# }
 
 ```
 
@@ -161,7 +203,7 @@ parameters {
 ```
 
 
-Even though this is a minimal model, we can compile it and derive posterior samples of the single parameter...
+Even though this is a minimal model, we can compile it and derive posterior samples of the  parameters...
 
 ```{r}
 
@@ -203,6 +245,10 @@ Lets say average wind speed is 9 kmh
 
 A Stan model that represents this statement. We arbitrarily set the standard deviation to 2.0 which should give a central 90% range of approximately 6 - 12 km/h for the sampled values.
 
+This is only defining prior beliefs about wind speed at the moment. ie. wind speeds are 0 to 20, and come from a normal distribution.
+No observed data, so we will only get samples of the prior.
+Next step (not yet) is to infer the underlying windspeed distribution based on observed wind speed measurements.
+
 ```{r}
 
 model_code_2 <- "
@@ -225,14 +271,14 @@ post2 <- get_samples(model_code_2)
 
 ```
 
-
+plot our prior belief about the distrubution of windspeed. No data observed yet to influence 
 
 ```{r}
+post2_draws <- as_draws_df(post2$draws())
+mu <- mean(post2_draws$windspeed) |> round(2)
+q90 <- quantile(post2_draws$windspeed, c(0.05, 0.95)) |> round(2)
 
-mu <- mean(post2$windspeed) |> round(2)
-q90 <- quantile(post2$windspeed, c(0.05, 0.95)) |> round(2)
-
-plot(density(post2$windspeed, from=0, adj = 1), 
+plot(density(post2_draws$windspeed, from=0, adj = 1), 
      main = sprintf("Mean windspeed: %g\n90%% range: %g - %g", mu, q90[1], q90[2]), 
      xlab = "Windspeed")
 
@@ -257,7 +303,7 @@ data {
   array[N] real<lower=0> y;  // observed values
 }
 parameters {
-  // Unknown average value of windspeed
+  // Unknown average value of windspeed. i.e unknown real value of mean windspeed (we could get the mean of our observed data, but that would just be the mean of a small sample. We want to estimate the population mean)
   real avg_windspeed;
   
   // Unknown standard deviation of the (assumed) normal distribution
@@ -266,9 +312,9 @@ parameters {
 model {
   // Relate the observed values to the unknown (to be estimated)
   // average windspeed
-  // Each value of y is assumed to come from this distribution
-  sigma ~ exponential(1);
-  y ~ normal(avg_windspeed, sigma);
+  // Each value of y is assumed to come from this distribution. 
+  sigma ~ exponential(1); // weakly informative prior. ie believe that sd of our normal is from this distribution
+  y ~ normal(avg_windspeed, sigma); // our likelihood. We assume observed data generated from normal distribution
 }
 "
 
@@ -290,13 +336,13 @@ post3 <- get_samples(
 )
 
 ```
-
+what is our estimate of true population distribution of mean wind speed and sigma parameter of normal distribution of windspeed.
 ```{r}
+post3_draws <- as_draws_df(post3$draws())
+mu <- round(mean(post3_draws$avg_windspeed), digits = 2)
+q <- round(quantile(post3_draws$avg_windspeed, c(0.05, 0.95)), digits = 2)
 
-mu <- round(mean(post3$avg_windspeed), digits = 2)
-q <- round(quantile(post3$avg_windspeed, c(0.05, 0.95)), digits = 2)
-
-dat_gg <- as.data.frame(post3) %>%
+dat_gg <- as.data.frame(post3_draws) %>%
   select(avg_windspeed, sigma) %>%
   tidyr::pivot_longer(everything(), names_to = "param", values_to = "value")
 
@@ -315,6 +361,7 @@ You are given some data for windspeed observed at separate fire spread lines and
 
 A Stan model for this task that naively treats the weather values as being drawn from a normal distribution. To make the model a little more interesting we will assume that weather is not independent across the fire spread lines, and express this by assuming that the wind speed values are drawn from normal distributions having a separate mean for each spread line but a common standard deviation (i.e. shrinkage across the lines). 
 
+Having a shared sd could be because You believe that while wind speed averages vary by line, the  fluctuation around those averages is similar everywhere (e.g., due to shared atmospheric conditions).
 
 ```{r}
 
@@ -330,10 +377,11 @@ parameters {
   vector[M] mu;
   
   // Common standard deviation across all spread lines
+  // ie assuming the variability (spread) of windspeed is similar across all locations
   real<lower=0> sigma;
 }
 model {
-  // Prior for the common standard deviation with a mean of 5.0
+  // Prior for the common standard deviation with a mean of 5.0 (1/0.2)
   sigma ~ exponential(0.2); 
   
   for (i in 1:N) {
@@ -374,8 +422,8 @@ post4 <- get_samples(
 
 
 ```{r}
-
-dat_gg <- as.data.frame(post4) %>% 
+post4_draws <- as_draws_df(post4$draws())
+dat_gg <- as.data.frame(post4_draws) %>% 
   select(-lp__) %>%
   
   tidyr::pivot_longer(starts_with("mu"), names_to = "line", values_to = "mean_wind") %>%
@@ -514,8 +562,8 @@ post4a <- get_samples(
 
 
 ```{r}
-
-dat_gg <- as.data.frame(post4a) %>% 
+post4a_draws <- as_draws_df(post4a$draws())
+dat_gg <- as.data.frame(post4a_draws) %>% 
   select(-lp__) %>%
   
   tidyr::pivot_longer(starts_with("mu"), names_to = "line", values_to = "mean_rh") %>%
@@ -603,7 +651,7 @@ data {
   int<lower=1> W;     // number of weather observations
   int<lower=1> L;     // number of fire spread lines
   
-  array[W] int<lower=1> wline_id;  // line ID for each weather observation
+  array[W] int<lower=1> wline_id;  // line ID for each weather observation (id matching ros id)
   vector<lower=0>[W] wind;         // wind speed values
   vector<lower=0>[W] rh;      // relative humidity values expressed as proportions
   vector<lower=0>[L] ros;   // outcome - rate of spread
@@ -611,7 +659,7 @@ data {
 transformed data {
   vector[L] ros_log = log(ros);
 }
-parameters {
+parameters { // unknowns or unobserved parameters
   vector[L] avg_wind;  // imputed wind value for each spread line
   real<lower=0> sigma_wind;
   
@@ -652,19 +700,19 @@ post5 <- get_samples(
   vars = c("alpha", "beta_wind", "beta_rh", "sigma_ros"),
   refresh = 100
 )
-
+post5_draws <- as_draws_df(post5$draws())
 ```
 
 
 
 ```{r}
 
-dat_post5 <- as.data.frame(post5)
+dat_post5 <- as.data.frame(post5_draws)
 
 # Wind and RH values for predictions
 dat_pred <- expand.grid(
-  wind = c(10, 20, 30, 40),
-  rh = c(20, 50, 80) / 100
+  wind = c(0,10, 20, 30, 40,50,60,70),
+  rh = c(10,20,30,40,50,60,70, 80) / 100
 )
 
 
@@ -727,83 +775,410 @@ ggplot(data = dat_gg, aes(x = wind)) +
 
 ```
 
+```{r}
+
+library(ggplot2)
+
+# Assuming your data looks like this:
+# df <- data.frame(rh = ..., wind = ..., ros = ...)
+
+ggplot(ros_pred, aes(x = rh*100, y = wind, fill = mid)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +  # or "magma", "viridis", etc.
+  labs(
+    title = "Mid Rate of Spread by RH and Wind Speed",
+    x = "Relative Humidity",
+    y = "Wind Speed (km/h)",  # or whatever unit you're using
+    fill = "ROS"
+  ) +
+  theme_minimal()
 
 
-
-
-## Michael's earlier code from this point on...
+```
 
 
 ```{r}
-dat_gg <- as.data.frame(post5) %>% 
-  select(-lp__) 
+dat_post5 <- as.data.frame(post5_draws)
+
+# Wind and RH values for predictions
+dat_pred <- expand.grid(
+  wind = c(20),
+  rh = c(10) / 100
+)
 
 
-dat_gg %>% 
-  tidyr::pivot_longer(everything()) %>% 
-  ggplot(aes(x = value, colour = name)) +
-  geom_density(linewidth = 1)+
-  #lims(x=c(0,50))+
-  facet_wrap(~name)
+ros_pred <- dat_post5 %>%
+  # Add prediction data to every posterior record
+  cross_join(dat_pred) %>%
+  
+  # Predict ROS values
+  mutate(mu = alpha + beta_wind * wind + beta_rh * rh,
+         ros_log = rnorm(n(), mu, sigma_ros),
+         ros = exp(ros_log))
+
+
+ggplot(ros_pred)+
+  geom_density(aes(x=ros))
 ```
 
 ```{r}
-#Create a grid of predictor values
-wind_seq <- seq(0, 100, length.out = 100)
-rh_mean <- mean(dat.test.2$mean_rh)
+library(shiny)
+library(ggplot2)
+library(dplyr)
 
-
-draws <- as.data.frame(post5)
-# Get posterior mean estimates
-beta_wnd <- draws$beta_wnd
-beta_rh <- draws$beta_rh
-alpha <- draws$alpha
-
-
-
-#Generate posterior predictions for wind effect
-
-# Use 100 draws for plotting, for speed
-set.seed(123)
-draw_idx <- sample(1:nrow(draws), 100)
-
-pred_df <- expand.grid(
-  wind = wind_seq,
-  draw = draw_idx
-) %>%
-  mutate(
-    alpha = alpha[draw],
-    beta_wnd = beta_wnd[draw],
-    beta_rh = beta_rh[draw],
-    pred = alpha + beta_wnd * wind + beta_rh * rh_mean
+ui <- fluidPage(
+  titlePanel("Predicted Fire Rate of Spread"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("rh", "Relative Humidity (%)", min = 0, max = 100, value = 10),
+      sliderInput("wind", "Wind Speed (km/h)", min = 0, max = 100, value = 20)
+    ),
+    
+    mainPanel(
+      plotOutput("rosPlot")
+    )
   )
+)
+
+server <- function(input, output) {
+  output$rosPlot <- renderPlot({
+    # Create the prediction input
+    dat_pred <- expand.grid(
+      wind = input$wind,
+      rh = input$rh / 100  # convert to proportion
+    )
+    
+    # Simulate ROS using the posterior
+    ros_pred <- dat_post5 %>%
+      dplyr::cross_join(dat_pred) %>%
+      mutate(
+        mu = alpha + beta_wind * wind + beta_rh * rh,
+        ros_log = rnorm(n(), mu, sigma_ros),
+        ros = exp(ros_log)
+      )
+    
+    # Plot the density
+    ggplot(ros_pred, aes(x = ros)) +
+      geom_density(fill = "firebrick", alpha = 0.7) +
+      labs(
+        title = "Posterior Predictive Distribution of Rate of Spread",
+        x = "Rate of Spread (ROS)",
+        y = "Density"
+      ) +
+      coord_cartesian(xlim = c(0, 20), ylim = c(0, 1)) +  # ← Adjust these as needed
+      theme_minimal()
+  })
+}
+
+shinyApp(ui, server)
+
+```
 
 
 
 
+### Gamma model
+```{r}
+model_code_6 <- "
+data {
+  int<lower=1> W;     // number of weather observations
+  int<lower=1> L;     // number of fire spread lines
 
-#Summarise the effect
+  array[W] int<lower=1> wline_id;         // line ID for each weather observation
+  vector<lower=0>[W] wind;                // wind speed
+  vector<lower=0>[W] rh;                  // RH (as proportion 0-1)
+  vector<lower=0>[L] ros;                 // rate of spread (positive)
+}
+
+parameters {
+  vector[L] avg_wind;                     // imputed wind per line
+  real<lower=0> sigma_wind;
+
+  vector<lower=0.01, upper=0.9>[L] avg_rh; // imputed RH per line
+  real<lower=0, upper=50> phi_rh;
+
+  real alpha;
+  real beta_wind;
+  real beta_rh;
+
+  real<lower=0> shape_ros;                // shape parameter for gamma
+}
+
+model {
+  vector[L] mu;     // mean ROS per line
+  vector[L] rate;   // gamma rate = shape / mean
+
+  // Weather model (same as before)
+  for (i in 1:W) {
+    wind[i] ~ normal(avg_wind[wline_id[i]], sigma_wind);
+    rh[i] ~ beta_proportion(avg_rh[wline_id[i]], phi_rh + 1);
+  }
+
+  // Gamma likelihood for ROS
+  for (i in 1:L) {
+    mu[i] = exp(alpha + beta_wind * avg_wind[i] + beta_rh * avg_rh[i]);  // ensure positivity
+    rate[i] = shape_ros / mu[i];
+    ros[i] ~ gamma(shape_ros, rate[i]);
+  }
+}
+"
+```
+
+
+
+```{r}
+
+post6 <- get_samples(
+  model_code_6,
+  data = model5_data,
+  vars = c("alpha", "beta_wind", "beta_rh", "shape_ros"),
+  refresh = 100
+)
+post6_draws <- as_draws_df(post6$draws())
+```
+
+```{r}
+
+# Wind and RH values for predictions
+dat_pred <- expand.grid(
+  wind = c(10,20,30,40,50,60),
+  rh = c(25) / 100
+)
+
+ros_pred <- post6_draws %>%
+  # Add prediction data to every posterior record
+  cross_join(dat_pred) %>%
+  
+  # Predict ROS using Gamma distribution
+  mutate(mu = exp(alpha + beta_wind * wind + beta_rh * rh),
+         ros = rgamma(n(), shape = shape_ros, rate = shape_ros / mu))
+
+
+
+ggplot(ros_pred)+
+  geom_density(aes(x=ros))+
+  facet_wrap(~wind,ncol=1)
+
+
+ros_pred_sum <- ros_pred %>% 
+  group_by(wind) %>% 
+  summarise(ros_mid=median(ros))
+
+
+ggplot(ros_pred_sum)+
+  geom_line(aes(y=ros_mid,x=wind))
+```
+```{r}
+model_code_7 <- "
+data {
+  int<lower=1> W;
+  int<lower=1> L;
+
+  array[W] int<lower=1> wline_id;
+  vector<lower=0>[W] wind;
+  vector<lower=0>[W] rh;
+  vector<lower=0>[L] ros;  // observed ROS (must be positive)
+}
+
+parameters {
+  vector[L] avg_wind;
+  real<lower=0> sigma_wind;
+
+  vector<lower=0.01, upper=0.9>[L] avg_rh;
+  real<lower=0, upper=50> phi_rh;
+
+  real alpha;
+  real beta_wind;
+  real beta_rh;
+
+  real<lower=0> shape_ros;  // shape parameter for Gamma
+}
+
+transformed parameters {
+  vector[L] mu;    // expected ROS (bounded between 0 and max_ros)
+  vector[L] rate;
+
+  real max_ros = 10;  // maximum plausible ROS in km/h
+
+  for (i in 1:L) {
+    real linpred = alpha + beta_wind * avg_wind[i] + beta_rh * avg_rh[i];
+    mu[i] = max_ros / (1 + exp(-linpred));  // sigmoid function
+    rate[i] = shape_ros / mu[i];
+  }
+}
+
+model {
+  // Weather observations
+  for (i in 1:W) {
+    wind[i] ~ normal(avg_wind[wline_id[i]], sigma_wind);
+    rh[i] ~ beta_proportion(avg_rh[wline_id[i]], phi_rh + 1);
+  }
+
+  // ROS model with sigmoid-shaped predictor response
+  ros ~ gamma(shape_ros, rate);
+}
+"
+
+```
+
+
+```{r}
+post7 <- get_samples(
+  model_code_7,
+  data = model5_data,
+  vars = c("alpha", "beta_wind", "beta_rh", "shape_ros"),
+  refresh = 100
+)
+```
+
+
+```{r}
+post7_draws <- as_draws_df(post7$draws())
+
+
+dat_pred <- expand.grid(
+  wind = c(10, 20, 30, 40, 50, 60,70,80,90),
+  rh = 0.9  # Relative humidity in proportion (0–1)
+)
+
+library(dplyr)
 library(tidyr)
 
-pred_summary <- pred_df %>%
-  group_by(wind) %>%
-  summarise(
-    mean = mean(pred),
-    lower = quantile(pred, 0.05),
-    upper = quantile(pred, 0.95)
+ros_pred <- post7_draws %>%
+  crossing(dat_pred) %>%
+  mutate(
+    linpred = alpha + beta_wind * wind + beta_rh * rh,
+    mu = 10 / (1 + exp(-linpred)),  # max_ros = 10 (km/h)
+    ros = rgamma(n(), shape = shape_ros, rate = shape_ros / mu)
   )
 
-#plot
-ggplot(pred_summary, aes(x = wind, y = mean)) +
-  geom_line() +
-  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+
+library(ggplot2)
+
+ggplot(ros_pred) +
+  geom_density(aes(x = ros), fill = "forestgreen", alpha = 0.5) +
+  facet_wrap(~wind, ncol = 1, scales = "free_y") +
   labs(
-    x = "Wind Speed",
-    y = "Predicted ROS",
-    title = "Marginal Effect of Wind on ROS (RH fixed at mean)"
+    title = "Posterior Predictive Densities (Sigmoid ROS Model)",
+    x = "ROS (km/h)",
+    y = "Density"
   )
+
+
+ros_pred_sum <- ros_pred %>%
+  group_by(wind) %>%
+  summarise(
+    ros_median = median(ros),
+    ros_lower = quantile(ros, 0.1),
+    ros_upper = quantile(ros, 0.9),
+    .groups = "drop"
+  )
+
+ggplot(ros_pred_sum) +
+  geom_ribbon(aes(x = wind, ymin = ros_lower, ymax = ros_upper), fill = "lightgreen", alpha = 0.4) +
+  geom_line(aes(x = wind, y = ros_median), color = "darkgreen", linewidth = 1.2) +
+  geom_point(aes(x = wind, y = ros_median), size = 2) +
+  labs(
+    title = "Predicted ROS vs Wind Speed (Sigmoid Model)",
+    x = "Wind speed (km/h)",
+    y = "ROS (km/h)"
+  )
+
 
 ```
 
 
+<!-- ## Michael's earlier code from this point on... -->
+
+
+<!-- ```{r} -->
+<!-- dat_gg <- as.data.frame(post5) %>%  -->
+<!--   select(-lp__)  -->
+
+
+<!-- dat_gg %>%  -->
+<!--   tidyr::pivot_longer(everything()) %>%  -->
+<!--   ggplot(aes(x = value, colour = name)) + -->
+<!--   geom_density(linewidth = 1)+ -->
+<!--   #lims(x=c(0,50))+ -->
+<!--   facet_wrap(~name) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- draws <- post5$draws(format="df") -->
+<!-- #Generate posterior predictions for wind effect -->
+
+<!-- pred_grid <- dat.test.2 %>%  -->
+<!--   select(wind=mean_wind,mean_rh) %>%  -->
+<!--   marginaleffects::datagrid(newdata=.,wind=seq(0,50)) -->
+
+<!-- pred_df <- pred_grid %>%  -->
+<!--   crossing(draws) %>%  -->
+<!--   mutate( -->
+<!--     pred = alpha + beta_wnd * wind + beta_rh * mean_rh -->
+<!--   ) -->
+
+
+<!-- #Summarise the effect -->
+<!-- library(tidyr) -->
+
+<!-- pred_summary <- pred_df %>% -->
+<!--   group_by(wind) %>% -->
+<!--   summarise( -->
+<!--     mean = mean(pred), -->
+<!--     lower = quantile(pred, 0.05), -->
+<!--     upper = quantile(pred, 0.95) -->
+<!--   ) -->
+
+<!-- #plot -->
+<!-- ggplot(pred_summary, aes(x = wind, y = mean)) + -->
+<!--   geom_line() + -->
+<!--   geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) + -->
+<!--   labs( -->
+<!--     x = "Wind Speed", -->
+<!--     y = "Predicted ROS", -->
+<!--     title = "Marginal Effect of Wind on ROS (RH fixed at mean)" -->
+<!--   ) -->
+
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- draws <- post5$draws(format="df") -->
+<!-- #Generate posterior predictions for wind effect -->
+
+<!-- pred_grid <- dat.test.2 %>%  -->
+<!--   select(mean_wind,rh=mean_rh) %>%  -->
+<!--   marginaleffects::datagrid(newdata=.,rh=seq(0,100)) -->
+
+<!-- pred_df <- pred_grid %>%  -->
+<!--   crossing(draws) %>%  -->
+<!--   mutate( -->
+<!--     pred = alpha + beta_wnd * mean_wind + beta_rh * rh -->
+<!--   ) -->
+
+
+<!-- #Summarise the effect -->
+<!-- library(tidyr) -->
+
+<!-- pred_summary <- pred_df %>% -->
+<!--   group_by(rh) %>% -->
+<!--   summarise( -->
+<!--     mean = mean(pred), -->
+<!--     lower = quantile(pred, 0.05), -->
+<!--     upper = quantile(pred, 0.95) -->
+<!--   ) -->
+
+<!-- #plot -->
+<!-- ggplot(pred_summary, aes(x = rh, y = mean)) + -->
+<!--   geom_line() + -->
+<!--   geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) + -->
+<!--   labs( -->
+<!--     x = "RH", -->
+<!--     y = "Predicted ROS", -->
+<!--     title = "Marginal Effect of RH on ROS (wind fixed at mean)" -->
+<!--   ) -->
+
+<!-- ``` -->
 

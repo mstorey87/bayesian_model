@@ -1,0 +1,409 @@
+---
+title: "bayesian_ros_model_2"
+output: html_document
+date: "2025-07-24"
+---
+
+# Sigmoid ROS Model in R with cmdstanr
+
+## Load required packages
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(stringr)
+library(here)
+
+library(cmdstanr)
+library(posterior)
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+MODEL_DIR <- here("stan_models")
+if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
+
+```
+## Load data
+## ROS and weather
+
+Load the ROS and weather data. Select a couple of weather variables to use as predictors for an initial model.
+
+```{r}
+dat.ros <- readRDS(here("data/lines.rds")) 
+dat.weather <- readRDS(here("data/weatherhourly.rds"))
+
+#select relevant ROS variable - ros and lineid, which matches lineid in weather data
+dat.ros <- dat.ros %>% 
+  select(lineid,ros=ros_kmh,
+         start_time_utc,
+         end_time_utc) 
+
+#select weather variables
+#mean refers to mean of all barra cells that intersect the spread line.
+dat.weather <- dat.weather %>% 
+  select(lineid,
+         wind=sfcWind_mean,
+         rh=hurs_mean,
+         time_utc_hourly
+  ) %>% 
+  mutate(wind=wind*3.6)#kmh
+
+
+#weather is sampled hourly for the spread time of each line
+#add variable to identify if BARRA sample is before, during or after spread time
+dat.weather <- dat.weather %>% 
+  left_join(dat.ros %>% select(lineid,start_time_utc,end_time_utc)) %>% 
+  
+  #round start and end times, to match barra times
+  mutate(start_time_utc_round=lubridate::round_date(start_time_utc,unit = "hours"),
+         end_time_utc_round=lubridate::round_date(end_time_utc,unit = "hours")) %>% 
+  
+  #remove any sampled barra weather from after end time
+  filter(time_utc_hourly <= end_time_utc_round) %>% 
+  
+  #calculate time difference between barra sample time and start time
+  #this may be useful to know, for example, wind speed 1 hour vs 3 hours before spread
+  mutate(diff_start_hour=as.numeric(difftime(time_utc_hourly,start_time_utc_round,units = "hours"))) %>% 
+  
+  select(lineid,wind,rh,diff_start_hour)
+
+
+#plot some of the weather and ros
+
+dat.ros %>% 
+  ggplot() +
+  geom_histogram(aes(x=ros))
+
+sample.ids <- sample(1:nrow(dat.ros), size = 9, replace = TRUE)
+dat.weather %>% 
+  filter(lineid %in% sample.ids) %>% 
+  ggplot()+
+  geom_density(aes(x=wind))+
+  facet_wrap(~lineid)
+
+
+
+```
+
+## organise data
+prepare data for stan model.
+```{r}
+
+# Weather data for fire spread lines
+dat <- dat.weather %>%
+  filter(diff_start_hour > -2)
+
+# Assemble Stan input list
+model_data <- list(
+  W = nrow(dat),                     # number of weather records
+  L = max(dat$lineid),              # number of lines
+  wline_id = dat$lineid,            # which line each weather obs belongs to
+  wind = dat$wind,                  # hourly wind values
+  rh = dat$rh / 100                 # hourly RH - convert RH to proportion
+)
+
+# Add rate of spread values for lines
+model_data <- c(model_data, 
+                 list(ros_line_id = dat.ros$lineid, ros = dat.ros$ros))
+
+# Check that the weather line IDs and the ROS line IDs line up properly
+MaxLineID <- max(model_data$wline_id)
+
+# Check there are no gaps in the line IDs
+stopifnot( all(model_data$wline_id %in% seq_len(MaxLineID)) )
+  
+# Check that all weather line IDs are in the ROS line IDs and vice versa
+stopifnot( length(symdiff(model_data$wline_id, model_data$ros_line_id)) == 0)
+
+```
+
+## Helper code
+
+A utility function for sampling from cmdstanr models. This was provided in Richard McElreath's workshop materials (`script.R`) but has been slightly tweaked here to store the Stan model in specified directory and with a file name based on the name of the variable passed to the `model_code` argument. 
+Modified to just return samples_1
+
+```{r}
+
+get_samples <- function(model_code, data=list(), 
+                        model_dir = MODEL_DIR, 
+                        model_basename = NULL,
+                        seed=123, chains=4,refresh=0) {
+  
+    if (is.null(model_basename)) {
+      model_basename <- deparse(substitute(model_code))
+      
+      # remove '_code' from the base name if present
+      model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+    }
+  
+    f <- write_stan_file(model_code, 
+                         dir = model_dir, 
+                         basename = model_basename)
+    
+    model_x <- cmdstan_model(f)
+    samples_1 <- model_x$sample(
+        data = data,
+        seed = seed,
+        chains = chains,
+        parallel_chains = chains,
+        refresh = 0
+    )
+    
+    return(samples_1)
+    # pr <- as_draws_rvars( samples_1$draws() )
+    # p <- list()
+    # for ( i in 1:length(pr) )
+    #     p[[ names(pr)[i] ]] <- draws_of( pr[[i]] )
+    # return(p)
+}
+
+```
+
+
+## Model code
+ROS model
+Sigmoid shaped linear predictor
+estimated mean weather for each line from hourly observations.
+
+```{r}
+model_code_sigmoid <- "
+data {
+  int<lower=1> W;
+  int<lower=1> L;
+
+  array[W] int<lower=1> wline_id;
+  vector<lower=0>[W] wind;
+  vector<lower=0>[W] rh;
+  vector<lower=0>[L] ros;
+}
+parameters {
+  vector[L] avg_wind;
+  real<lower=0> sigma_wind;
+
+  vector<lower=0.01, upper=0.99>[L] avg_rh;
+  real<lower=0, upper=50> phi_rh;
+
+  real alpha;
+  real beta_wind;
+  real beta_rh;
+
+  real<lower=0> shape_ros;
+}
+model {
+  real max_ros = 15;
+  vector[L] mu;
+  vector[L] rate;
+
+  for (i in 1:W) {
+    wind[i] ~ normal(avg_wind[wline_id[i]], sigma_wind);
+    rh[i] ~ beta_proportion(avg_rh[wline_id[i]], phi_rh + 1);
+  }
+
+  for (i in 1:L) {
+    real linpred = alpha + beta_wind * avg_wind[i] + beta_rh * avg_rh[i];
+    mu[i] = max_ros / (1 + exp(linpred));
+    rate[i] = shape_ros / mu[i];
+  }
+
+  ros ~ gamma(shape_ros, rate);
+}
+"
+```
+
+## Get samples
+
+
+```{r}
+#fit. The helper function now returns samples (CmdStan object)
+post_sigmoid <- get_samples(
+  model_code_sigmoid,
+  data = model_data ,
+  refresh = 100
+)
+
+# Extract tidy posterior draws
+post_sigmoid_draws <- as_draws_df(post_sigmoid$draws()) %>% 
+  spread_draws(alpha,beta_wind,beta_rh,shape_ros,avg_wind[lineid],avg_rh[lineid],
+               
+               ndraws = 500)
+
+# Add observed predictors for plotting
+dat.obs.sum <- dat.weather %>% 
+  group_by(lineid) %>% 
+  summarise(wind_obs_mean=mean(wind),
+            rh_obs_mean=mean(rh))
+
+post_sigmoid_draws <- post_sigmoid_draws %>% 
+  left_join(dat.obs.sum)
+
+```
+
+
+## predict
+Generate predictions for new data
+
+```{r}
+#prediction grid
+dat_pred <- expand.grid(
+  wind = seq(0, 80, 20),
+  rh = c(0.2, .8)
+)
+
+#posterior predictions
+ros_pred <- post_sigmoid_draws %>%
+  tidyr::crossing(dat_pred) %>%
+  mutate(
+    linpred = alpha + beta_wind * wind + beta_rh * rh,
+    mu = 10 / (1 + exp(linpred)),
+    ros = rgamma(n(), shape = shape_ros, rate = shape_ros / mu)
+  )
+```
+
+
+Plot sample of predicted mean values 
+```{r}
+ros_pred %>% 
+  filter(.draw %in% sample(unique(.draw),size=50)) %>% 
+  mutate(rh=factor(rh*100)) %>% 
+  ggplot(data=.)+
+  geom_line(aes(x = wind,y = mu, color = rh, group = paste(rh,.draw)), alpha = 0.9)
+```
+
+summarise predicted ROS 
+
+```{r}
+ros_pred_sum <- ros_pred %>%
+  group_by(wind,rh) %>%
+  summarise(
+    prc_ros_2=sum(ros > 2)/n() *100,
+    ros_median = median(ros),
+    ros_lower_90 = quantile(ros, 0.05),
+    ros_upper_90 = quantile(ros, 0.95),
+    ros_lower_50 = quantile(ros, 0.25),
+    ros_upper_50 = quantile(ros, 0.75),
+    .groups = "drop"
+  ) %>% 
+  mutate(rh=factor(rh*100))
+```
+
+
+plot median prediction with intervals
+```{r}
+ggplot(ros_pred_sum ) +
+    geom_ribbon(aes(x = wind, ymin = ros_lower_50, ymax = ros_upper_50,
+                    fill = rh), 
+               , alpha = 0.3) +
+  geom_line(aes(x = wind, y = ros_median, color = rh), linewidth = 1.2) +
+  labs(x = "Wind (km/h)", y = "Rate of Spread (km/h)",
+       title = "Predicted Rate of Spread vs Wind Speed")
+
+
+
+
+```
+
+
+boxplots of predictions with interval
+```{r}
+ros_pred_sum %>% 
+  ggplot(aes(x = wind)) +
+
+  geom_linerange(aes(ymin = ros_lower_90, ymax = ros_upper_90, colour = rh),
+                 position = position_dodge(width = 5),
+                 linewidth = 1) +
+  
+  geom_linerange(aes(ymin = ros_lower_50, ymax = ros_upper_50, colour = rh),
+                 position = position_dodge(width = 5),
+                 linewidth = 2.5, size = 1.5) +
+  
+  labs(colour = "Relative humidity",
+       x = "Wind speed (km/h)",
+       y = "Predicted ROS")  
+```
+
+
+tile plot of chance prediction ROS > 2
+
+```{r}
+
+ggplot(ros_pred_sum, aes(x = wind, y = rh, fill = prc_ros_2)) +
+  geom_tile() +
+   geom_text(aes(label = round(prc_ros_2,0)), alpha = 0.7) +
+  scale_fill_gradient(low="white",high="red",name = "% > 2kmh") +
+  labs(title = "% chance ROS > 2kmh") +
+  theme_minimal()
+```
+
+## Shiny app 
+Shiny app to produce predictions by selecting rh and wind speed
+```{r}
+
+library(shiny)
+library(ggplot2)
+library(dplyr)
+
+ui <- fluidPage(
+  titlePanel("Predicted Rate of Spread"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("rh", "Relative Humidity (%)", min = 0, max = 100, value = 10),
+      sliderInput("wind", "Wind Speed (km/h)", min = 0, max = 100, value = 20)
+    ),
+    
+    mainPanel(
+      plotOutput("rosPlot")
+    )
+  )
+)
+
+server <- function(input, output) {
+  output$rosPlot <- renderPlot({
+    # Create the prediction input
+    dat_pred <- expand.grid(
+      wind = input$wind,
+      rh = input$rh / 100  # convert to proportion
+    )
+    
+    # Simulate ROS using the posterior
+ros_pred <- post_sigmoid_draws %>%
+  filter(.draw %in% sample(unique(.draw),size=50)) %>% #sample of draws to speed up processing time.
+  tidyr::crossing(dat_pred) %>%
+  mutate(
+    linpred = alpha + beta_wind * wind + beta_rh * rh,
+    mu = 10 / (1 + exp(linpred)),
+    ros = rgamma(n(), shape = shape_ros, rate = shape_ros / mu)
+  )
+    
+ros_pred_sum <- ros_pred %>% 
+  group_by(wind,rh) %>% 
+  summarise(ros_2kmh=round(sum(ros>2)/n()*100,0))
+
+ros_2km <- ros_pred_sum$ros_2kmh
+
+glimpse(ros_pred_sum)
+
+    # Plot the density
+    ggplot(ros_pred, aes(x = ros)) +
+      geom_density(fill = "firebrick", alpha = 0.7) +
+      geom_vline(xintercept = 2,color="red")+
+      geom_text(aes(x = 10, y = 0.8, label = paste0(ros_2km,"% chance ROS > 2km/h")), fontface = "bold", size = 5)+
+      labs(
+        title = "Posterior Predictive Distribution of Rate of Spread",
+        x = "Rate of Spread (km/h)",
+        y = "Density",
+        fontface="bold"
+      ) +
+      coord_cartesian(xlim = c(0, 20), ylim = c(0, 1)) +  # ← Adjust these as needed
+      theme_minimal()+
+  theme(
+    text=element_text(face="bold",size=15)
+  )
+  })
+}
+
+shinyApp(ui, server)
+```
+

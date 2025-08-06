@@ -1,0 +1,2553 @@
+---
+title: "ROS Modelling script version 3"
+output: slidy_presentation
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(sf)
+library(stringr)
+library(geosphere)
+library(runjags)
+
+runjags.options(modules = "glm")
+
+theme_set( theme_bw() )
+
+
+##### Helper functions 
+
+# Read sf data from a CSV file. This is to get round some
+# pesky problems when using st_read directly (numeric vars
+# converted to factors; WKT column not removed)
+fn_read <- function(x) {
+  dat <- read.csv(x, stringsAsFactors = FALSE)
+  dat <- sf::st_as_sf(dat, crs = 3112, wkt = "WKT", remove = TRUE)
+  rename(dat, geometry = WKT)
+}
+
+
+#a short function for standardizing a variable
+scale_this <- function(x){
+  (x - mean(x,na.rm=T)) / sd(x,na.rm=T)
+}
+
+
+set.seed(42)
+
+```
+
+
+
+# Load lines
+load spread lines from file.
+There is a seperate csv that is loaded which has each fire name and a "include" attribute. 
+This indicates whether it should be included in analysis based on a visual inspection against
+a base map to see if at least 50% of the spread line is not grass
+
+Also load polygons, just for map making purposes
+```{r include=FALSE}
+
+
+
+dat.lines.filter <- read.csv("D:\\UOW_PhD\\ROS_scans\\Analysis\\Statistics\\MichaelBedward\\fire_spread_rate\\data_raw\\max_spread_lines_20_min_with_notes_v2.csv") %>% 
+  select(NAME2,include,include_reason,brd_rgn)
+
+
+
+path <- here("data_raw", "max_spread_lines_20_min.csv")
+
+dat.lines.sf <- fn_read(path) %>%
+
+  mutate(start_DTUTC = as.POSIXct(start_DTUTC, tz = "UTC"),
+         end_DTUTC = as.POSIXct(end_DTUTC, tz = "UTC")) %>%
+
+  # Add an integer line id
+  mutate(lineid = row_number()) %>%
+  
+  # Add an integer fire/day id to use for random effect index
+  # (this this should probably be just on fire name - MB)
+  #mutate(groupseqid = as.integer(factor(group_id))) %>% 
+  
+  left_join(dat.lines.filter) %>% 
+  
+  filter(include=="Y" & mins_spread <=301) 
+ 
+
+#load polygons too
+path <- here("data_raw", "all_spread_polys_20_min.csv")
+
+dat.poly <- fn_read(path)
+
+
+
+```
+
+## Map
+
+map of fire spread measurement
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, out.width='100%'}
+firemap <- dat.lines.sf %>% select(ROS)
+
+mapview::mapview(firemap,layer.name="ROS")+ 
+  mapview::mapview(dat.poly,fill=NA,color="red")
+
+```
+
+
+#load weather
+load weather from file
+
+```{r include=FALSE}
+# load data - weather
+# 
+# For each lineid (from dat.lines), there are multiple weather observations (each hour during progression and multiple BARRA weather grid pixels for each hour)
+
+path <- here("data_raw", "weather_20_min_50km_8hrs.csv")
+dat.weather.load<-data.table::fread(path,nrows = 1)
+dat.weather.load<-data.table::fread(path,
+                               select = c('NAME2',
+                                          'group_id',
+                                          'barra_dt_posix_adj',
+                                          'sample_dist',
+                                          'ffdi_barra',
+                                          'ffdi_barra_idwdf',
+                                          'wnd_kmh_10m',
+                                          'relhum_sfc',
+                                          'av_wndgust10m_kmh',
+                                          'HDWI_50_nr',
+                                           'vpd_max_50_nr',
+                                          'vpd_sfc',
+                                          'FMI_sfc',
+                                           'ws_max_50_nr','ws_max_50_deep',
+                                          'ws_max_700xhpa','ws_max_800xhpa',
+                                           'idw_rain50',"rain14",
+                                          "rain50","rain100",
+                                           'soil_mois_lv1',
+                                           'max_temp_scrn',
+                                          "idw_ffdi",
+                                          "idw_windspeed",
+                                          "idw_relhumidity",
+                                          "idw_temperature",
+                                          "idw_windgust",
+                                          "idw_drought",
+                                          "br_row_num",
+                                          "is_land","elev_br",
+                                          "sample_xy_wkt"))
+
+
+
+#calculate some lagged variables (not necassary)
+# dat.weather.load <- dat.weather.load %>% 
+#   arrange(barra_dt_posix_adj) %>% 
+#   group_by(NAME2,sample_xy_wkt) %>% 
+#   mutate(relhum_sfc_roll3=zoo::rollmean(relhum_sfc,3,fill=NA,align="right"),
+#          relhum_sfc_roll2=zoo::rollmean(relhum_sfc,2,fill=NA,align="right")) %>% 
+#   ungroup()
+  
+```
+
+
+
+manipulate weather data.
+add posix field
+filter based on time tolerance and start end times
+summarize to spatial max (grouped by line NAME2 and hour)
+```{r include=FALSE}
+
+dat.weather <- dat.weather.load %>% 
+  
+  #filter(is_land==1) %>% 
+  filter(sample_dist < 50000)%>%
+  mutate(DTUTC = as.POSIXct(barra_dt_posix_adj, tz = "UTC",format="%Y-%m-%dT%H:%M")) 
+
+# Tag values that are during, or within one hour of, the time interval for the 
+# respective spread line
+time.tol <- lubridate::minutes(60)
+
+dat <- dat.lines.sf %>%
+  st_drop_geometry() %>% 
+  mutate(t0 = start_DTUTC - time.tol, 
+         t1 = end_DTUTC + time.tol) %>%
+  
+  select(NAME2, t0, t1)
+
+
+dat.weather <- dat.weather %>%
+  left_join(dat, by = "NAME2") %>%
+
+  mutate(during_line = DTUTC >= t0 & DTUTC <= t1) %>%
+  select(-t0, -t1) %>% 
+  filter(as.logical(during_line)) %>%
+  select(-during_line) %>% 
+  
+  #summarize to spatial max
+  group_by(NAME2,DTUTC) %>% 
+  
+  summarise_all(list(min=min,max=max),na.rm=T) %>% 
+  
+  mutate_at(vars(contains("temp")),function(x)x-273.15) %>% 
+  mutate_at(vars(contains("t2m")),function(x)x-273.15) %>% 
+  data.frame() 
+
+```
+
+
+# load landscape data
+load 100 m sample points along spread line
+do classification according to NVIS veg type (I didn't end up using this other then for summary stats)
+apply a conversion from phoenix fuel hazard to vesta according to Hines 2010 OFH guide
+
+```{r include=FALSE}
+#load data - landscape
+path <- here("data_raw", "spread_sp_20_min_v6_100m.csv")
+
+dat.landscape<-data.table::fread(path) %>% data.frame()
+
+#load mccoll predicted vesta values and join
+
+path <- here("data_raw","fuel_predictions_mccoll_gausden.csv")
+mccoll <- read.csv(path) %>% 
+  select(nid,mfs=metres_from_start,S_HZ_all,NS_HZ_all,E_HZ_all,NS_TOP_all)
+
+dat.landscape <- dat.landscape %>% 
+  mutate(nid=row_number()) %>% 
+  left_join(mccoll,by="nid") %>% 
+
+  filter(NAME2 %in% dat.lines.sf$NAME2)
+
+
+
+#convert to vesta fuel scores according to hines 2010
+dat.landscape<- dat.landscape %>% 
+  
+  #round to nearest 1 (i.e. classes)
+  mutate(S_HZ_all_round=ceiling(S_HZ_all),
+         NS_HZ_all_round=ceiling(NS_HZ_all),
+         E_HZ_all_round=ceiling(E_HZ_all)) %>% 
+  
+  #apply hines conversion
+  mutate(S_HZ_all_vesta=if_else(S_HZ_all_round==5,4,
+                                     if_else(S_HZ_all_round==4,3.5,S_HZ_all_round))) %>% 
+  mutate(NS_HZ_all_vesta=if_else(NS_HZ_all_round==5,4,
+                                     if_else(NS_HZ_all_round==4,3.5,NS_HZ_all_round))) %>% 
+  mutate(E_HZ_all_vesta=if_else(E_HZ_all_round==5,4,
+                                     if_else(E_HZ_all_round==4,3.5,E_HZ_all_round))) 
+  
+
+
+#create some summary predictors from each line
+# Add a sequential id for each line point
+dat.landscape <- dat.landscape %>%
+
+  mutate(FPC_cat=cut(FPC,breaks = c(-1,15,60,101),labels = c('low','mod','high'))) %>% 
+
+  mutate(veg_group=ifelse(MVG_NAME %in% c("Eucalypt Open Forests","Eucalypt Tall Open Forests",
+                                     "Other Forests and Woodlands",
+                                     "Casuarina Forests and Woodlands",
+                                     "Rainforests and Vine Thickets",
+                                     "Callitris Forests and Woodlands",
+                                            "Regrowth, modified native vegetation"),"FOR",NA)) %>% 
+  
+  mutate(veg_group = ifelse(MVG_NAME %in% c("Acacia Shrublands","Other Shrublands",
+                                            "Heathlands"),"SHR", veg_group)) %>% 
+  
+   mutate(veg_group = ifelse(MVG_NAME %in% c("Mallee Woodlands and Shrublands",
+                                            "Eucalypt Woodlands",
+                                            "Eucalypt Open Woodlands",
+                                            "Unclassified native vegetation"),"WOOD", veg_group)) %>% 
+
+  mutate(veg_group = ifelse(MVG_NAME %in% c("Cleared, non-native vegetation, buildings",
+                                             "Tussock Grasslands" ,
+                                             "Other Grasslands, Herblands, Sedgelands and Rushlands",
+                                             "Unknown/no data",
+                                             "Naturally bare - sand, rock, claypan, mudflat",
+                                             "","Inland aquatic - freshwater, salt lakes, lagoons"
+                                             ),"GRS",veg_group)) %>% 
+  
+  mutate(is_grass=ifelse(veg_group=="GRS",1,0))
+
+
+
+
+
+
+#load table indicating if fire is mostly dry euc forest with shrubby understorey (based on phoenix fuel types)
+#group by and summarize toget data frame with fires that are majority dry euc
+path <- here("data_raw", "fuel_classed_vesta.csv")
+dat.dryeuc <- read.csv(path)
+
+dat.landscape.majority.dryeuc <- dat.landscape %>% 
+  
+  left_join(dat.dryeuc %>% select(Type_Name,is_shrubby_dry_euc_forest)) %>% 
+  group_by(NAME2) %>% 
+  summarise(n=n(),ndryeuc=sum(is_shrubby_dry_euc_forest)) %>% 
+  mutate(prc_dryeuc=ndryeuc/n*100) %>% 
+  filter(prc_dryeuc >= 50)
+  
+
+
+
+
+
+#create data frame of majority veg type for each line.
+dat.landscape.majority<-dat.landscape %>% 
+  group_by(NAME2,veg_group) %>%
+  summarise(n=n()) %>% 
+  mutate(freq=n/sum(n)) %>% 
+  arrange(NAME2,desc(freq)) %>% 
+  filter(NAME2 %in% dat.lines.sf$NAME2) %>% 
+  group_by(NAME2) %>% 
+  filter(row_number()==1)
+  
+table(dat.landscape.majority$veg_group)/nrow(dat.landscape.majority)*100
+
+
+
+#create list of names of grass fires
+#note this select a few plantations fires due to the "cleared/other" MVG NAME
+dat.landscape.grass<-dat.landscape %>% 
+  group_by(NAME2) %>%
+  summarise(sumgrass = sum(is_grass),n=n()) %>%
+  mutate(freq.grass = sumgrass/n*100) %>% 
+  mutate(mostlygrass=ifelse(freq.grass>=50,1,0)) 
+
+
+
+# dat.landscape.cover.fraction <- dat.landscape %>% 
+#   mutate(TPCF_grassy=if_else(Total.plant.cover.fraction %in% c("0.prc","6.prcto11.prc","0.prcto6.prc"),1,0)) %>% 
+#   group_by(NAME2) %>% 
+#   summarise(nTPFC.grassy.sum=sum(TPCF_grassy),n=n()) %>% 
+#   mutate(freq.grass.nTPFC=nTPFC.grassy.sum/n) %>% 
+#   filter(freq.grass.nTPFC >= .5 )
+# 
+# 
+# 
+# 
+# 
+# 
+# # 
+# # 
+# dat.landscape<- dat.landscape %>% 
+#    filter(NAME2 %in% dat.lines.sf$NAME2) %>% 
+#    left_join(dat.landscape.grass %>% select(NAME2,mostlygrass))# %>% 
+#    #filter(mostlygrass==0)
+# 
+
+
+```
+
+
+
+
+
+
+# add IDs
+filter data frames to ensure all lines in lines data frame are also in weather and vice versa
+add integer line id and group id variable (fire-day, i.e. group_id) for JAGS modelling
+```{r include=FALSE}
+dat.lines.sf <- dat.lines.sf %>% 
+ filter(NAME2 %in% dat.weather$NAME2)%>%
+
+  # Add an integer line id
+  mutate(lineid = row_number()) %>%
+  
+  # Add an integer fire/day id to use for random effect index
+  # (this this should probably be just on fire name - MB)
+  mutate(groupseqid = as.integer(factor(group_id))) 
+
+# Split into spatial and non-spatial data frames
+dat.lines <- st_drop_geometry(dat.lines.sf)
+
+dat.lines.sf <- dat.lines.sf %>%
+  select(lineid, geometry)
+
+rm(firemap,dat,dat.lines.filter,dat.poly,time.tol,dat.landscape.grass,dat.landscape.majority)
+
+```
+
+make sure WA fire not included, because they don't have Pheonixfuel
+Run this instead if don't want to include WA fires, which don't have Phoenix values
+```{r eval=FALSE, include=FALSE}
+
+dat.landscape <- dat.landscape %>% 
+  filter(!is.na(accum_tns_sfcelev))
+
+dat.weather <- dat.weather %>% 
+  filter(NAME2 %in% dat.landscape$NAME2)
+
+dat.weather.summarystats <- dat.weather %>% 
+  select(wnd_kmh_10m_max,soil_mois_lv1_min,relhum_sfc_min,vpd_sfc_max,ffdi_barra_idwdf_max,av_wndgust10m_kmh_max,max_temp_scrn_max,idw_drought_max)%>%
+    psych::describe(quant=c(.25,.75)) %>%
+    as_tibble(rownames="rowname")  %>%
+  mutate(across(where(is.numeric),~round(.x,1))) %>% 
+  select(rowname,mean,min,max,sd) %>% 
+    print()
+
+
+dat.lines.sf <- dat.lines.sf %>% 
+ filter(NAME2 %in% dat.landscape$NAME2)%>%
+
+  # Add an integer line id
+  mutate(lineid = row_number()) %>%
+  
+  # Add an integer fire/day id to use for random effect index
+  # (this this should probably be just on fire name - MB)
+  mutate(groupseqid = as.integer(factor(group_id))) #%>% 
+  #left_join(dat.landscape.grass %>% select(NAME2,mostlygrass)) %>% 
+  #mutate(mostlygrass=ifelse(is.na(mostlygrass),1,mostlygrass))
+
+
+# Split into spatial and non-spatial data frames
+dat.lines <- st_drop_geometry(dat.lines.sf)
+
+dat.lines.sf <- dat.lines.sf %>%
+  select(lineid, geometry)
+
+```
+
+
+
+### ROS 2002 - 2018 observations summary
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+dat.plot <- dat.lines %>% left_join(dat.landscape %>% select(NAME2,veg_group)) %>%  mutate(year=lubridate::year(start_DTUTC))
+
+ggplot()+
+  geom_histogram(data=dat.lines,aes(x=ROS))+
+  ggtitle("ROS obs 2002 - 2018")
+
+
+ggplot(data=dat.plot %>% group_by(year) %>% summarise(count=n())) +
+  geom_bar(aes(y=count,x=year),stat="identity",position="dodge") +
+  scale_x_continuous(breaks = seq(2002,2018,by=1)) + 
+  ggtitle("ROS observations by year")
+  
+
+
+ggplot(data=dat.landscape %>% group_by(veg_group) %>% summarise(count=n())) + 
+  geom_bar(aes(fill=veg_group,y=count,x=veg_group),stat="identity",position="dodge") +
+  ggtitle("total grass proportion across all sample points")
+
+
+
+
+
+
+
+
+```
+
+
+
+
+### ROS Model - McArthur
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE,fig.width=7, fig.height=6}
+# 
+# ROS calculated using Noble 1980 equation: FFDI (mean of spread time) and accumulated fuel tns/ha (mean along spread line,dodgy conversion from Phoenix Fuel Hazard to tonnes/ha)
+# 
+#calculate data - noble ROS
+dat.mcarthur <- dat.landscape %>% 
+  select(NAME2,accum_tns_all,accum_tns_elevated,accum_tns_surface) %>% 
+  group_by(NAME2) %>% 
+  summarise_all(mean) %>% 
+  left_join(dat.lines %>% select(NAME2,ROS)) 
+
+dat.weather.mean <- dat.weather %>% 
+  select(NAME2,ffdi_barra_max,ffdi_barra_idwdf_max) %>% 
+  group_by(NAME2) %>% 
+  summarise_all(mean,na.rm=TRUE)
+
+dat.mcarthur <- dat.mcarthur %>% left_join(dat.weather.mean) %>% 
+  mutate(accum_tns_sfc_elev=(accum_tns_elevated+accum_tns_surface)) %>% 
+  mutate(noble_ros=0.0012*ffdi_barra_idwdf_max*accum_tns_all) %>% 
+  mutate(noble_ros2=0.0012*ffdi_barra_idwdf_max*accum_tns_sfc_elev)%>% 
+  mutate(noble_ros_br=0.0012*ffdi_barra_max*accum_tns_all) %>% 
+  mutate(noble_ros_br2=0.0012*ffdi_barra_max*accum_tns_sfc_elev) %>% 
+  mutate(noble_ros_25tns=0.0012*ffdi_barra_idwdf_max*25)%>% 
+    mutate(ROSplus35=ROS+(.35*ROS))%>% 
+  mutate(ROSless35=ROS-(.35*ROS)) %>% 
+  mutate(midhits35=ifelse(noble_ros2 > ROSless35 & noble_ros2 < ROSplus35,1,0)) %>% 
+  mutate(midhits35_25tns=ifelse(noble_ros_25tns > ROSless35 & noble_ros_25tns < ROSplus35,1,0)) %>% 
+    filter(!is.na(accum_tns_all)) 
+
+dat.mcarthur.fuelsummary <- dat.mcarthur %>% 
+  select(accum_tns_surface,accum_tns_elevated,accum_tns_sfc_elev)%>%
+    psych::describe(quant=c(.25,.75)) %>%
+    as_tibble(rownames="rowname")  %>%
+    print()
+
+
+# Bottom plot uses 25 tonnes/ha and still seems to underpredict
+bold.text <- element_text(face = "bold", color = "black",size = 15)
+
+dat.plot <- dat.mcarthur %>% 
+  filter(!is.na(accum_tns_all)) %>% 
+  mutate()
+
+g1 <- ggplot(data=dat.plot)+
+  geom_point(aes(y=noble_ros2,x=ROS)) +
+  ylim(0,8)+ xlim(0,8) +
+    geom_abline(slope=1, intercept = 0)+
+  labs(y="Predicted ROS",x="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+g1.x <- ggplot(data=dat.plot)+
+  geom_point(aes(y=noble_ros_25tns,x=ROS),color="grey",alpha=.9) +
+    geom_point(aes(y=noble_ros2,x=ROS)) +
+    ylim(0,10)+ xlim(0,10) +
+    geom_abline(slope=1, intercept = 0)+
+    labs(y=expression(bold("Predicted ROS km"~h^-1)),x=expression(bold("Observed ROS km"~h^-1)))+
+    theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) +    
+  geom_abline(slope=1.35, intercept = 0,linetype="dotted",size=1)+
+    geom_abline(slope=0.65, intercept = 0,linetype="dotted",size=1)+
+    scale_y_continuous(breaks = seq(0,10,2),limits = c(0,10),expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0,10,2),limits = c(0,10),expand = c(0,0)) +
+       theme(axis.text.x=element_text(hjust=0.8,vjust=0.2))
+
+
+
+g2 <- ggplot(data=dat.plot)+
+  geom_point(aes(x=noble_ros_25tns,y=ROS)) +
+  ylim(0,8)+ xlim(0,8) +
+  geom_abline(slope=1, intercept = 0)+
+  labs(x=expression(bold("Predicted ROS km"~h^-1)),y=expression(bold("Observed ROS km"~h^-1)))+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+g3 <- ggplot(data=dat.plot)+
+  geom_point(aes(x=ffdi_barra_idwdf_max,y=ROS)) +
+  labs(x="FFDI",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+g4 <- ggplot(data=dat.plot)+
+  geom_point(aes(x=accum_tns_sfc_elev,y=ROS)) +
+  labs(x="Fuel Load",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+
+g5 <- ggplot(data=dat.plot)+
+  geom_point(aes(x=ROS-noble_ros2,y=ROS)) +
+  labs(x="Residual",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+# relationship
+
+print("ROS and mk 5 ROS")
+cor(dat.plot$noble_ros2,dat.plot$ROS)
+summary(lm(ROS~noble_ros2,data=dat.plot))
+MLmetrics::MAPE(dat.plot$noble_ros2,dat.plot$ROS)
+MLmetrics::MAE(dat.plot$noble_ros2,dat.plot$ROS)
+tdr::tdStats(dat.plot$noble_ros2,dat.plot$ROS,"mbe")
+
+x <- dat.plot %>% filter(ROS<2)
+tdr::tdStats(x$noble_ros2,x$ROS,"mbe")
+MLmetrics::MAPE(x$noble_ros2,x$ROS)
+MLmetrics::MAE(x$noble_ros2,x$ROS)
+
+print("ROS and mk 5 ROS high fuel")
+cor(dat.plot$noble_ros_25tns,dat.plot$ROS)
+summary(lm(ROS~noble_ros_25tns,data=dat.plot))
+MLmetrics::MAE(dat.plot$noble_ros_25tns,dat.plot$ROS)
+MLmetrics::MAPE(dat.plot$noble_ros_25tns,dat.plot$ROS)
+tdr::tdStats(dat.plot$noble_ros_25tns,dat.plot$ROS,"mbe")
+
+print("ROS and fuel")
+cor(dat.plot$accum_tns_sfc_elev,dat.plot$ROS)
+summary(lm(ROS~accum_tns_sfc_elev,data=dat.plot))
+
+
+print("ROS and FFDI")
+cor(dat.plot$ffdi_barra_idwdf_max,dat.plot$ROS)
+summary(lm(ROS~ffdi_barra_idwdf_max,data=dat.plot))
+
+print("ROS and mk 5 FFDI > 30")
+dat.plot.ffdi30 <- dat.plot %>% filter(ffdi_barra_idwdf_max>35)
+cor(dat.plot.ffdi30$noble_ros2,dat.plot.ffdi30$ROS)
+summary(lm(ROS~noble_ros2,data=dat.plot.ffdi30))
+
+print("% obs above 2 km hr")
+table(dat.plot$ROS > 2)/nrow(dat.plot)
+table(dat.plot$noble_ros2 > 2)/nrow(dat.plot)
+
+print("% obs above 3 km hr")
+table(dat.plot$ROS > 3)/nrow(dat.plot)
+table(dat.plot$noble_ros2 > 3)/nrow(dat.plot)
+
+#Vesta
+print("McArthur hits 35 %")
+print(" ")
+table(dat.plot$midhits35)/nrow(dat.plot)*100
+
+print("McArthur hits 35 % 25 tns")
+print(" ")
+table(dat.plot$midhits35_25tns)/nrow(dat.plot)*100
+
+
+g1
+g2
+g3
+g4
+g5
+
+gridExtra::grid.arrange(g1.x,g5,g3,g4)
+
+
+
+#rm(g1,g2,g3,g4,g5,g1.x,dat.plot.ffdi30,dat.plot,x)
+```
+
+
+
+## ROS model prediction (Dry Eucalypt Forest Fire model)
+script based on CSIRO spark page https://research.csiro.au/spark/resources/model-library/vesta/
+
+Calculate a DEFFM/Vesta ROS
+Use Table 6 in Cheny 2012 to get indicate fuel levels from TSF
+
+```{r}
+bold.text <- element_text(face = "bold", color = "black",size = 15)
+
+#load vesta table, a look up table based on Table 6 in Cheney 2012
+vesta_table <- read.csv("D:\\UOW_PhD\\ROS_scans\\Analysis\\Statistics\\MichaelBedward\\fire_spread_rate\\data_raw\\table6_cheney2012.csv")
+
+
+#attach vesta table after getting mean TSF value for each line
+dat.vesta <- dat.landscape %>% 
+  select(NAME2,S_HZ_all_vesta,NS_HZ_all_vesta,NS_TOP_all,TSF,accum_fuel_surface) %>% 
+  group_by(NAME2) %>% 
+  summarise_all(mean) %>% 
+  #additional estimate of fuel values based on Cheney paper
+  mutate(TSF=round(TSF)) %>% 
+  left_join(vesta_table,by="TSF") %>% 
+  left_join(dat.lines %>% select(NAME2,ROS)) 
+  
+  
+#calulate mean weather again for each line and attach to lines data frame
+
+dat.weather.mean <- dat.weather %>% 
+  select(NAME2,ffdi_barra_max,ffdi_barra_idwdf_max,wind_speed=wnd_kmh_10m_max,
+         rel_hum=relhum_sfc_min,temp=max_temp_scrn_max,DTUTC,vpd=vpd_sfc_max) %>% 
+  group_by(NAME2) %>% 
+  summarise_all(mean,na.rm=TRUE) %>% 
+  mutate(DT_east=lubridate::with_tz(DTUTC,tzone = "Australia/Sydney")) %>% 
+  mutate(hour=lubridate::hour(DT_east)) 
+
+dat.vesta <- dat.vesta %>% left_join(dat.weather.mean,by="NAME2") %>% 
+  filter(!is.na(accum_fuel_surface)) %>% 
+  
+  filter(NAME2 %in% dat.landscape.majority.dryeuc$NAME2)
+
+
+
+
+
+
+
+#calculate DEFFM/Vesta ROS based on https://research.csiro.au/spark/resources/model-library/vesta/
+#this is the variant including a near surface height
+
+dat.vesta$Mf <- NA
+dat.vesta$head_speed_kmh <- NA
+
+for(i in 1:nrow(dat.vesta)){
+  #Fuel Hazard Score, Height, surface and near surface
+  FHSs <- dat.vesta$TSF_FHSs[i]#dat.vesta$accum_vesta_surface[i]
+  FHSns <- dat.vesta$TSF_FHSns[i]
+  Hns <- dat.vesta$TSF_Hns[i]
+  
+  
+  hour <- dat.vesta$hour[i]
+  rel_hum <- dat.vesta$rel_hum[i]
+  temp <- dat.vesta$temp[i]
+  wind_speed <- dat.vesta$wind_speed[i]
+  
+  #calculate moisture function based on time of day (3 different periods), temperature and humidity
+  if (hour > 11 & hour < 17){
+    Mf = 2.76 + (0.124*rel_hum) - (0.0187*temp)}
+  
+  ##Calculating fuel moisture for other daylight hours (from 9:00 to 11:59 and 17:00 to 19:59 in this example)
+  else if ((hour < 12 & hour > 8) | (hour > 16 & hour < 20)){
+    Mf = 3.6 + (0.169*rel_hum) - (0.045*temp)} 
+  
+  ##Calculating fuel moisture for night time hours (from 20:00 to 8:59) in this example 
+  else{
+    Mf = 3.08 + (0.198*rel_hum) - (0.0483*temp)} 
+  
+  dat.vesta$Mf[i] <- Mf
+  
+##Calculate moisture coefficients from Burrows (1999) 
+  moisture_coeff = 18.35 * '^'(Mf,-1.495)
+  
+  
+  ##Calculate spread rate (in m/s) 
+  ## if wind speed is less than 5, than the theory is moisture mainly constrols ROS
+  
+  if ( wind_speed > 5 ){
+    head_speed = (30.0 + 1.5308 * '^'(wind_speed-5,0.8576) * 
+                    '^'(FHSs,0.9301) * '^'(FHSns*Hns,0.6366) * 1.03 ) *
+    moisture_coeff/3600
+  }
+  else{
+    head_speed = 30.0 * moisture_coeff/3600
+  }
+  
+  dat.vesta$head_speed_kmh[i] <- (head_speed * 3.6 )
+
+  
+  rm(head_speed)
+}
+
+dat.vesta$vesta_resid <- dat.vesta$ROS-dat.vesta$head_speed_kmh
+
+
+
+
+#alternate using mccoll predicted fuel. 
+#calculate DEFFM/Vesta ROS based on https://research.csiro.au/spark/resources/model-library/vesta/
+#this is the variant including a near surface height
+
+dat.vesta$Mf <- NA
+dat.vesta$head_speed_kmh_mccoll <- NA
+
+for(i in 1:nrow(dat.vesta)){
+  #Fuel Hazard Score, Height, surface and near surface
+  FHSs <- dat.vesta$S_HZ_all_vesta[i]
+  FHSns <- dat.vesta$NS_HZ_all_vesta[i]
+  Hns <- dat.vesta$NS_TOP_all[i]
+  
+  
+  hour <- dat.vesta$hour[i]
+  rel_hum <- dat.vesta$rel_hum[i]
+  temp <- dat.vesta$temp[i]
+  wind_speed <- dat.vesta$wind_speed[i]
+  
+  #calculate moisture function based on time of day (3 different periods), temperature and humidity
+  if (hour > 11 & hour < 17){
+    Mf = 2.76 + (0.124*rel_hum) - (0.0187*temp)}
+  
+  ##Calculating fuel moisture for other daylight hours (from 9:00 to 11:59 and 17:00 to 19:59 in this example)
+  else if ((hour < 12 & hour > 8) | (hour > 16 & hour < 20)){
+    Mf = 3.6 + (0.169*rel_hum) - (0.045*temp)} 
+  
+  ##Calculating fuel moisture for night time hours (from 20:00 to 8:59) in this example 
+  else{
+    Mf = 3.08 + (0.198*rel_hum) - (0.0483*temp)} 
+  
+  dat.vesta$Mf[i] <- Mf
+  
+##Calculate moisture coefficients from Burrows (1999) 
+  moisture_coeff = 18.35 * '^'(Mf,-1.495)
+  
+  
+  ##Calculate spread rate (in m/s) 
+  ## if wind speed is less than 5, than the theory is moisture mainly constrols ROS
+  
+  if ( wind_speed > 5 ){
+    head_speed = (30.0 + 1.5308 * '^'(wind_speed-5,0.8576) * 
+                    '^'(FHSs,0.9301) * '^'(FHSns*Hns,0.6366) * 1.03 ) *
+    moisture_coeff/3600
+  }
+  else{
+    head_speed = 30.0 * moisture_coeff/3600
+  }
+  
+  dat.vesta$head_speed_kmh_mccoll[i] <- (head_speed * 3.6 )
+
+  
+  rm(head_speed)
+}
+
+dat.vesta$vesta_resid_mccoll <- dat.vesta$ROS-dat.vesta$head_speed_kmh_mccoll
+
+
+
+
+
+
+##calculate is prediction with 35%
+dat.vesta <- dat.vesta %>% 
+  mutate(ROSplus35=ROS+(.35*ROS))%>% 
+  mutate(ROSless35=ROS-(.35*ROS)) %>% 
+  mutate(vestahit35=ifelse(head_speed_kmh > ROSless35 & head_speed_kmh < ROSplus35,1,0)) %>% 
+  mutate(vestahit35_mccoll=ifelse(head_speed_kmh_mccoll > ROSless35 & head_speed_kmh_mccoll < ROSplus35,1,0))
+
+
+
+dat.vesta.fuelsummary <- dat.vesta %>% 
+  select(matches("HZ|TOP|_FHS|_Hns")) %>%
+    psych::describe(quant=c(.25,.75)) %>%
+    as_tibble(rownames="rowname")  %>%
+    print()
+print("n vesta predictions with 35%")
+print(table(dat.vesta$vestahit35)/nrow(dat.vesta)*100)
+
+
+#plot result
+gg_vesta <- ggplot(data=dat.vesta)+
+    geom_point(aes(y=head_speed_kmh_mccoll,x=ROS),color="grey",alpha=.9) +
+  geom_point(aes(y=head_speed_kmh,x=ROS)) +
+  geom_abline(slope=1, intercept = 0)+
+  labs(y=expression(bold("Predicted ROS km"~h^-1)),x=expression(bold("Observed ROS km"~h^-1)))+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) +    
+  geom_abline(slope=1.35, intercept = 0,linetype="dotted",size=1)+
+    geom_abline(slope=0.65, intercept = 0,linetype="dotted",size=1)+
+    scale_y_continuous(breaks = seq(0,10,2),limits = c(0,10),expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0,10,2),limits = c(0,10),expand = c(0,0)) +
+       theme(axis.text.x=element_text(hjust=0.8,vjust=0.2))
+
+
+
+
+gg_vesta_resid <- ggplot(data=dat.vesta)+
+  geom_point(aes(x=vesta_resid,y=ROS)) +
+  #ylim(0,8)+ xlim(0,8) +
+  labs(x="Residual",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+gg_ws <- ggplot(data=dat.vesta)+
+  geom_point(aes(x=wind_speed,y=ROS)) +
+  labs(x="Wind speed",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+gg_temp <- ggplot(data=dat.vesta)+
+  geom_point(aes(x=temp,y=ROS)) +
+  labs(x="Temperature",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+gg_rh <- ggplot(data=dat.vesta)+
+  geom_point(aes(x=rel_hum,y=ROS)) +
+  labs(x="RH",y="Observed ROS")+
+  theme(axis.title = bold.text,axis.text.x = bold.text,axis.text.y = bold.text,axis.ticks.length = unit(0.5, "mm")) 
+
+
+
+
+
+
+
+
+# relationship
+
+print("ROS and DEFFM ROS")
+cor(dat.vesta$head_speed_kmh,dat.vesta$ROS)
+summary(lm(ROS~head_speed_kmh,data=dat.vesta))
+MLmetrics::MAPE(dat.vesta$head_speed_kmh,dat.vesta$ROS)
+MLmetrics::MAE(dat.vesta$head_speed_kmh,dat.vesta$ROS)
+tdr::tdStats(dat.vesta$head_speed_kmh,dat.vesta$ROS,"mbe")
+
+
+print("ROS and DEFFM ROS with mccoll fuel")
+cor(dat.vesta$head_speed_kmh_mccoll,dat.vesta$ROS)
+summary(lm(ROS~head_speed_kmh_mccoll,data=dat.vesta))
+MLmetrics::MAPE(dat.vesta$head_speed_kmh_mccoll,dat.vesta$ROS)
+MLmetrics::MAE(dat.vesta$head_speed_kmh_mccoll,dat.vesta$ROS)
+tdr::tdStats(dat.vesta$head_speed_kmh_mccoll,dat.vesta$ROS,"mbe")
+
+
+x <- dat.vesta %>% filter(ROS<=2)
+tdr::tdStats(x$head_speed_kmh,x$ROS,"mbe")
+MLmetrics::MAPE(x$head_speed_kmh,x$ROS)
+MLmetrics::MAE(x$head_speed_kmh,x$ROS)
+
+
+print("ROS and FHRns")
+cor(dat.vesta$TSF_FHRns,dat.vesta$ROS)
+summary(lm(ROS~TSF_FHRns,data=dat.vesta))
+
+print("ROS and Hns")
+cor(dat.vesta$TSF_Hns,dat.vesta$ROS)
+summary(lm(ROS~TSF_Hns,data=dat.vesta))
+
+print("ROS and FHRs")
+cor(dat.vesta$TSF_FHRs,dat.vesta$ROS)
+summary(lm(ROS~TSF_FHRs,data=dat.vesta))
+
+print("ROS and WS")
+cor(dat.vesta$wind_speed,dat.vesta$ROS)
+summary(lm(ROS~wind_speed,data=dat.vesta))
+
+print("ROS and DEFFM WS > 30")
+dat.vesta.ws30 <- dat.vesta %>% filter(wind_speed>30)
+cor(dat.vesta.ws30$head_speed_kmh,dat.vesta.ws30$ROS)
+summary(lm(ROS~head_speed_kmh,data=dat.vesta.ws30))
+
+print("Vesta hits 35%")
+print(" ")
+table(dat.vesta$vestahit35)/nrow(dat.vesta)*100
+
+print("Vesta hits 35% mccoll")
+print(" ")
+table(dat.vesta$vestahit35_mccoll)/nrow(dat.vesta)*100
+
+
+
+
+
+
+gg_vesta
+gg_vesta_resid
+gg_temp
+gg_rh
+gg_ws
+
+gridExtra::grid.arrange(gg_vesta,gg_vesta_resid,nrow=1)
+
+gridExtra::grid.arrange(g1.x,gg_vesta,nrow=1)
+
+
+```
+
+
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+#sigmoid code for 1 var
+
+model.sigmoid.code.X1 <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+    
+    #residual
+    
+    resid[i] <- ROS[i]-mu.ROS[i] #residual#
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+
+
+#sigmoid code for 2 weather var
+
+model.sigmoid.code.X2 <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i]  + b2*mu.X2[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+
+
+
+#sigmoid code for 3 weather var
+
+model.sigmoid.code.X3 <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+    X3[i] ~ dnorm(mu.X3[lineid[i]], phi.X3[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+    
+    mu.X3[i] ~ dnorm(0, 1)
+    phi.X3[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i]  + b2*mu.X2[i] + b3*mu.X3[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+  b3 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+
+#sigmoid code for 4 weather var
+
+model.sigmoid.code.X4 <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+    X3[i] ~ dnorm(mu.X3[lineid[i]], phi.X3[lineid[i]])
+    X4[i] ~ dnorm(mu.X4[lineid[i]], phi.X4[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+    
+    mu.X3[i] ~ dnorm(0, 1)
+    phi.X3[i] ~ dexp(1)
+    
+    mu.X4[i] ~ dnorm(0, 1)
+    phi.X4[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i]  + b2*mu.X2[i] + b3*mu.X3[i] + b4*mu.X4[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+  b3 ~ dnorm(0, 1)
+  b4 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+
+#sigmoid code for 5 weather var
+
+model.sigmoid.code.X5 <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+    X3[i] ~ dnorm(mu.X3[lineid[i]], phi.X3[lineid[i]])
+    X4[i] ~ dnorm(mu.X4[lineid[i]], phi.X4[lineid[i]])
+    X5[i] ~ dnorm(mu.X5[lineid[i]], phi.X5[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+    
+    mu.X3[i] ~ dnorm(0, 1)
+    phi.X3[i] ~ dexp(1)
+    
+    mu.X4[i] ~ dnorm(0, 1)
+    phi.X4[i] ~ dexp(1)
+    
+    mu.X5[i] ~ dnorm(0, 1)
+    phi.X5[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i]  + b2*mu.X2[i] + b3*mu.X3[i] + b4*mu.X4[i]+ b5*mu.X5[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+  b3 ~ dnorm(0, 1)
+  b4 ~ dnorm(0, 1)
+  b5 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+#sigmoid code for 2 weather var
+
+
+model.sigmoid.code.X1.interaction <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i] + b2*mu.X2[i] + b3*mu.X1[i]*mu.X2[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+    
+    #residual
+    
+    resid[i] <- ROS[i]-mu.ROS[i] #residual#
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+  b3 ~ dnorm(0, 1)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+
+
+
+# A-priori value (plucked out of thin air) for maximum possible rate of spread
+ROS.MAX <- 15
+```
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+### Prediction for effects plots
+# Prediction function
+fn_predict.x1 <- function(x1, b0, b1) { 
+  lp <- b0 + b1*x1# +z
+  ROS.MAX / (1 + exp(lp))
+}
+
+# Prediction function
+fn_predict.x2 <- function(x1,x2, b0, b1,b2) { 
+  lp <- b0 + b1*x1+ b2*x2# +z
+  ROS.MAX / (1 + exp(lp))
+}
+
+
+# Prediction function
+fn_predict.x3 <- function(x1,x2,x3, b0, b1,b2,b3) { 
+  lp <- b0 + b1*x1+ b2*x2 + b3 * x3# +z
+  ROS.MAX / (1 + exp(lp))
+}
+
+# Prediction function
+fn_predict.x4 <- function(x1,x2,x3,x4, b0, b1,b2,b3,b4) { 
+  lp <- b0 + b1*x1+ b2*x2 + b3 * x3 + b4 * x4# +z
+  ROS.MAX / (1 + exp(lp))
+}
+
+
+
+
+
+#function for plotting of jags results
+
+fn_jags_predict_plot <- function(modelmcmc,model_data,dat.join,var_name="X1",n_vars=1){
+  # Combine posterior samples for all chains into a simple matrix
+  post <- do.call(rbind, modelmcmc)
+  #z <- as.matrix(apply(post[,startsWith(colnames(post),"z")],1,mean))
+  #colnames(z) <- "z"
+  
+  #post prediction with 1 variable
+  
+  if(n_vars==1){
+    # We only need the b0 and b1 parameters for prediction
+    post <- post[, c("b0", "b1")]
+    #post <- cbind(post,z)
+    
+    # Evenly spaced sequence of X1 values for prediction
+    pX1 <- seq(min(model_data["X1"][[1]]), max(model_data["X1"][[1]]), length.out = 50)
+    
+    # For each row of the posterior matrix, predict ROS for 
+    # each pX1 value
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x1(pX1, params[1], params[2])
+    })
+    
+    
+    #post prediction with 2 variable
+    
+    
+  }else if(n_vars==2){
+    # We only need the b0 and b1 parameters for prediction
+    post <- post[, c("b0", "b1","b2")]
+    
+    
+    # Evenly spaced sequence of X1 values for prediction
+    if(var_name=="X1"){
+      pX1 <- seq(min(model_data["X1"][[1]],na.rm = TRUE), max(model_data["X1"][[1]],na.rm = TRUE), length.out = 50)
+      pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+    }else if(var_name=="X2"){
+      pX2 <- seq(min(model_data["X2"][[1]],na.rm = TRUE), max(model_data["X2"][[1]],na.rm = TRUE), length.out = 50)
+      pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+    }
+    
+    
+    # For each row of the posterior matrix, predict ROS for 
+    # each pX1 value
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x2(pX1,pX2, params[1], params[2], params[3])
+    })
+    
+    
+    #post prediction with 3 variable
+    
+  }else if(n_vars==3){
+    # We only need the b0 and b1 parameters for prediction
+    post <- post[, c("b0", "b1","b2","b3")]
+    
+    
+    # Evenly spaced sequence of X1 values for prediction
+    if(var_name=="X1"){
+      pX1 <- seq(min(model_data["X1"][[1]]), max(model_data["X1"][[1]]), length.out = 50)
+      pX2 <- mean(model_data["X2"][[1]])
+      pX3 <- mean(model_data["X3"][[1]])
+    }else if(var_name=="X2"){
+      pX2 <- seq(min(model_data["X2"][[1]]), max(model_data["X2"][[1]]), length.out = 50)
+      pX1 <- mean(model_data["X1"][[1]])
+      pX3 <- mean(model_data["X3"][[1]])
+    }else if(var_name=="X3"){
+      pX3 <- seq(min(model_data["X3"][[1]]), max(model_data["X3"][[1]]), length.out = 50)
+      pX1 <- mean(model_data["X1"][[1]])
+      pX2 <- mean(model_data["X2"][[1]])
+    }
+    
+    
+    # For each row of the posterior matrix, predict ROS for 
+    # each pX1 value
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x3(pX1,pX2,pX3, params[1], params[2], params[3], params[4])
+    })
+    
+    #post prediction with 4 variable
+    
+  }else if(n_vars==4){
+    # We only need the b0 and b1 parameters for prediction
+    post <- post[, c("b0", "b1","b2","b3","b4")]
+    
+    
+    # Evenly spaced sequence of X1 values for prediction
+    if(var_name=="X1"){
+      pX1 <- seq(min(model_data["X1"][[1]],na.rm = TRUE), 
+                 max(model_data["X1"][[1]],na.rm = TRUE), length.out = 50)
+      pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+      pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+      pX4 <- mean(model_data["X4"][[1]],na.rm = TRUE)
+    }else  if(var_name=="X2"){
+      pX2 <- seq(min(model_data["X2"][[1]],na.rm = TRUE),
+                 max(model_data["X2"][[1]],na.rm = TRUE), length.out = 50)
+      pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+      pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+      pX4 <- mean(model_data["X4"][[1]],na.rm = TRUE)
+    }else  if(var_name=="X3"){
+      pX3 <- seq(min(model_data["X3"][[1]],na.rm = TRUE),
+                 max(model_data["X3"][[1]],na.rm = TRUE), length.out = 50)
+      pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+      pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+      pX4 <- mean(model_data["X4"][[1]],na.rm = TRUE)
+    }else  if(var_name=="X4"){
+      pX4 <- seq(min(model_data["X4"][[1]],na.rm = TRUE),
+                 max(model_data["X4"][[1]],na.rm = TRUE), length.out = 50)
+      pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+      pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+      pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+    }
+    
+    
+    # For each row of the posterior matrix, predict ROS for 
+    # each pX1 value
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x4(pX1,pX2,pX3,pX4, params[1], params[2], params[3], params[4], params[5])
+    })
+    
+  }
+  
+  
+  # pdat will have a row for each input X1 value, and a column
+  # for each posterior sample. Now, for each row, calculate
+  # summary statistics (median and quantiles)
+  pdat.stats <- apply(pdat, 1, function(x) {
+    quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+  
+  # Transpose and add input values for plotting
+  pdat.stats <- t(pdat.stats)
+  colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+  pdat.stats <- as.data.frame(pdat.stats)
+  
+  
+  
+  
+  if(var_name=="X1"){
+    lbl <- c(-5,-4,-3,-2,-1,0,1,2,3,4,5)
+    lbl_unscaled <- round(lbl*X1_sd+X1_mean,1)
+    pdat.stats["plotX"] <- pX1
+    
+    # For comparison, plot points for ROS vs mean X1 for each line
+    dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+      group_by(lineid) %>%
+      summarize(plotX = mean(X1)) %>%
+      left_join(dat.ros, by = "lineid")
+    
+  }else if(var_name=="X2"){
+    lbl <- c(-5,-4,-3,-2,-1,0,1,2,3,4,5)
+    lbl_unscaled <- round(lbl*X2_sd+X2_mean,1)
+    pdat.stats["plotX"] <- pX2
+    
+    dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+      group_by(lineid) %>%
+      summarize(plotX = mean(X2)) %>%
+      left_join(dat.ros, by = "lineid")
+    
+    
+  }else if(var_name=="X3"){
+    lbl <- c(-5,-4,-3,-2,-1,0,1,2,3,4,5)
+    lbl_unscaled <- round(lbl*X3_sd+X3_mean,1)
+    pdat.stats["plotX"] <- pX3
+    
+    dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+      group_by(lineid) %>%
+      summarize(plotX = mean(X3)) %>%
+      left_join(dat.ros, by = "lineid")
+    
+  }else if(var_name=="X4"){
+    lbl <- c(-5,-4,-3,-2,-1,0,1,2,3,4,5)
+    lbl_unscaled <- round(lbl*X4_sd+X4_mean,1)
+    pdat.stats["plotX"] <- pX4
+    
+    dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+      group_by(lineid) %>%
+      summarize(plotX = mean(X4,na.rm = TRUE)) %>%
+      left_join(dat.ros, by = "lineid")
+    
+  }
+  
+  
+  g <- ggplot(data = pdat.stats, aes(x = plotX)) +
+    geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+    geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+    geom_line(aes(y = mid)) +
+    
+    geom_point(data = dat.obs, aes(y = ROS),
+               size = 2, alpha = 0.3) +
+    
+    labs(x = var_name, y = "Predicted ROS") +
+    scale_x_continuous(breaks = lbl,labels = lbl_unscaled)
+  
+  return(g)
+  
+  
+}
+```  
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+### residuals plot function
+fn_jags_resids_plot <- function(modelmcmc,model_data){
+  
+  # Combine posterior samples for all chains into a simple matrix
+  #then select just slope parameters
+  post <- do.call(rbind, modelmcmc) %>% 
+    data.frame() %>% 
+    select(starts_with("b"))
+  
+  n_vars = length(names(post))-1
+  
+  # Get observed values
+  dat.ros <- data.frame(ROS=model_data$ROS) %>% 
+    mutate(lineid=row_number())
+  
+  m <- model_data[startsWith(names(model_data),"X")] %>% bind_cols()
+  dat.obs <- data.frame(m,lineid=model_data$lineid) %>% 
+    left_join(dat.ros)
+  
+  # For each row of the posterior matrix, predict ROS for 
+  # each pX1 value
+  if(n_vars==1){
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x1(dat.obs$X1, params[1], params[2])
+    })
+  }else if(n_vars==2){
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x2(dat.obs$X1,dat.obs$X2, params[1], params[2], params[3])
+    })
+  }else if(n_vars==3){
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x3(dat.obs$X1,dat.obs$X2,
+                    dat.obs$X3,params[1], 
+                    params[2], params[3], params[4])
+    })
+  }else if(n_vars==4){
+    pdat <- apply(post, 1, function(params) {
+      fn_predict.x4(dat.obs$X1,dat.obs$X2,
+                    dat.obs$X3,dat.obs$X4,params[1], 
+                    params[2], params[3], params[4],params[5])
+    })
+  }
+  
+  # pdat will have a row for each input X1 value, and a column
+  # for each posterior sample. Now, for each row, calculate
+  # summary statistics (median and quantiles)
+  pdat.stats <- apply(pdat, 1, function(x) {
+    quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+  
+  # Transpose and add input values for plotting
+  pdat.stats <- t(pdat.stats)
+  colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+  pdat.stats <- as.data.frame(pdat.stats)
+  
+  pdat.stats <- cbind(pdat.stats,dat.obs)
+  
+  pdat.stats <- pdat.stats %>% 
+    group_by(lineid) %>% 
+    summarise_all(mean) %>% 
+    mutate(resids_lwr95=ROS-lwr95,
+           resids_lwr50=ROS-lwr50,
+           resids_mid=ROS-mid,
+           resids_upr50=ROS-upr50,
+           resids_upr95=ROS-upr95)
+  
+  pdat.stats <- pdat.stats %>% left_join(dat.lines %>% select(NAME2,lineid,IBRA_REG))
+  
+  pdat.stats <- pdat.stats %>% 
+    left_join(dat.landscape %>% 
+     select(NAME2,accum_tns_all,
+            accum_tns_sfcelev,dem,canopy_height,TSF) %>% 
+                                           group_by(NAME2) %>% 
+                                           summarise_all(mean,na.rm=T))
+  
+  pdat.stats <- pdat.stats %>% left_join(dat.landscape.grass %>% select(NAME2,freq.grass))
+  
+  varnames <- names(pdat.stats)
+  varnames <- varnames[!str_detect(varnames,"lwr|upr|mid|NAME2|lineid")]
+  gglist <- list()
+  for(vn in varnames){
+    if(vn=="IBRA_REG"){
+    g <- ggplot(data = pdat.stats, aes_string(x = vn)) +
+      geom_violin(aes(y = resids_mid,colour=factor(IBRA_REG))) +
+      
+      labs(y = "mid resids ROS")+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+      theme(legend.position = "none")
+    }else{
+      g <- ggplot(data = pdat.stats, aes_string(x = vn)) +
+      geom_point(aes(y = resids_mid)) +
+      geom_linerange(aes(ymin=resids_lwr50,ymax=resids_upr50,colour="red")) +
+      labs(y = "mid resids ROS")
+      
+    }
+    
+    
+    gglist[[vn]] <- g
+  }
+  return(gglist)
+  
+  
+}
+
+
+```
+
+
+
+
+### Example of the submodel for weather variables
+Quick look at examples the shape of prior distributions for phi and mu
+These are what the priors look like (not updated with actual data using run.jags)
+Display a small selection of the fitted Gamma distributions in relation to the input wind values.
+
+
+
+```{r eval=FALSE, include=FALSE}
+
+dat <- dat.weather %>% 
+  filter(NAME2=="Esperance_f2_201511171500_A") %>% 
+  select(wind=wnd_kmh_10m_max)
+
+test1.code <- "model {
+  for (i in 1:length(wind)) {
+    wind[i] ~ dnorm(mu, phi) # if gamma -  phi*mu = shape, phi = rate #likelihoood specification
+  }
+  
+  # Prior for Gamma mean
+  mu ~ dnorm(50,10^-2)
+  
+  # Prior for dispersion parameter phi
+  phi ~ dexp(0.1)
+}"
+
+
+# Run the model with just one MCMC chain
+test1.model <- run.jags(test1.code, 
+                        monitor = c("mu", "phi","wind"), 
+                        data = dat, 
+                        n.chains = 1, 
+                        inits = list(mu = 10, phi = 1), 
+                        burnin = 1000, 
+                        sample = 1000,
+                        thin = 10)
+
+summary(test1.model)
+
+plot(test1.model)
+
+#test1.model$mcmc
+
+bold.text <- element_text(face = "bold", color = "black",size = 16)
+bold.text.theme <-  theme(axis.title = bold.text,axis.text.x = bold.text,
+                          axis.text.y = bold.text,
+                          axis.ticks.length = unit(1.5, "mm"))
+
+# Matrix of posterior samples
+samples <- as.matrix(test1.model$mcmc)
+
+N <- 20
+ii <- sample(1:nrow(samples), N)
+
+xwind <- seq(0, 2 * max(dat$wind), length.out = 100)
+
+dat.gg <- as.data.frame(samples[ii, ]) %>%
+  mutate(rep = ii,
+         phi=LaplacesDemon::prec2sd(phi)) %>%
+  
+  group_by(rep) %>%
+  do(
+    data.frame(wind = xwind, density = dnorm(xwind, .$mu, .$phi),mu=.$mu))
+
+dat.gg.points <-as.data.frame(samples[ii, ]) %>% 
+  mutate(rep=ii) %>% 
+  select(rep,wind=mu) %>% 
+  left_join(dat.gg %>% group_by(rep) %>% summarise(density=max(density)))
+
+g <- ggplot(data = dat.gg, aes(x = wind)) +
+  geom_line(aes(y = density, group = rep), alpha = 0.4,size=0.75) +
+  geom_point(data=dat.gg.points,aes(y=density))+
+  
+  geom_rug(data = dat, size = 1)+ 
+  xlab("Wind Speed")+
+  bold.text.theme
+
+g
+
+```
+
+
+
+
+
+### Bayesian model of ROS - FFDI
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+dat.join.1 <- dat.weather %>% 
+  filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = ffdi_barra_idwdf_max) 
+
+X1_mean <- mean(dat.join.1$X1)
+X1_sd <- sd(dat.join.1$X1)
+
+dat.sum.1.orgnl <- data.frame(X1_mean,X1_sd)
+names(dat.sum.1.orgnl) <- paste0(names(dat.sum.1.orgnl),"_orgnl")
+
+dat.join.1 <- dat.join.1 %>% 
+  mutate(X1=scale_this(X1)) %>% 
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+
+
+### Data for model
+model.sigmoid.data.1 <- c(as.list(dat.join.1), 
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+
+
+
+### Run/Sample
+model.sigmoid.1 <- run.jags(model.sigmoid.code.X1,
+                         monitor = c("b0", "b1", "phi.ROS","z", "z.sd", "LogLik",'resid',"lp","mu.X1","X1","lineid"),
+                         data = model.sigmoid.data.1, 
+                         n.chains = 6, 
+                         burnin = 1000, 
+                         sample = 2000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = runif(1,-1,1),
+                             phi.ROS = 1
+                           )
+                         })
+
+
+plot(model.sigmoid.1,vars = c("b0", "b1", "phi.ROS"))
+
+
+summary(model.sigmoid.1,vars = c("b0", "b1", "phi.ROS"))
+
+LogLik.model.sigmoid.1 <- do.call(rbind, model.sigmoid.1$mcmc)
+LogLik.model.sigmoid.1 <- LogLik.model.sigmoid.1[,str_detect(colnames(LogLik.model.sigmoid.1),"LogLik")]
+waic.model.sigmoid.1 <- loo::waic(LogLik.model.sigmoid.1)
+loo.model.sigmoid.1 <- loo::loo(LogLik.model.sigmoid.1)
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+fn_jags_predict_plot(model.sigmoid.1$mcmc,model.sigmoid.data.1,dat.join.1,"X1",1)
+#print(fn_jags_resids_plot(model.sigmoid.1$mcmc,model.sigmoid.data.1))
+```
+
+
+
+### Bayesian model of ROS - FFDI input variables
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+dat.join.2 <- dat.weather %>% 
+    filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = wnd_kmh_10m_max,X2=max_temp_scrn_max,X3=relhum_sfc_min,X4=idw_drought_max) 
+
+X1_mean <- mean(dat.join.2$X1)
+X1_sd <- sd(dat.join.2$X1)
+
+X2_mean <- mean(dat.join.2$X2)
+X2_sd <- sd(dat.join.2$X2)
+
+X3_mean <- mean(dat.join.2$X3)
+X3_sd <- sd(dat.join.2$X3)
+
+X4_mean <- mean(dat.join.2$X4,na.rm = T)
+X4_sd <- sd(dat.join.2$X4,na.rm = T)
+
+
+dat.sum.2.orgnl <- data.frame(X1_mean,X1_sd,X2_mean,X2_sd,X3_mean,X3_sd,X4_mean,X4_sd)
+names(dat.sum.2.orgnl) <- paste0(names(dat.sum.2.orgnl),"_orgnl")
+
+dat.join.2 <- dat.join.2 %>% 
+  mutate(X1=scale_this(X1),
+         X2=scale_this(X2),
+         X3=scale_this(X3),
+         X4=scale_this(X4)) %>% 
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+
+
+### Data for model
+model.sigmoid.data.2 <- c(as.list(dat.join.2), 
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+
+
+
+### Run/Sample
+model.sigmoid.2 <- run.jags(model.sigmoid.code.X4,
+                         monitor = c("b0", "b1","b2","b3","b4", "phi.ROS", "z.sd", "LogLik"),
+                         data = model.sigmoid.data.2, 
+                         n.chains = 6, 
+                         burnin = 1000, 
+                         sample = 2000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = runif(1,-1,1),
+                             b2 = runif(1,-1,1),
+                             b3 = runif(1,-1,1),
+                             b4 = runif(1,-1,1),
+                             phi.ROS = 1
+                           )
+                         })
+
+
+plot(model.sigmoid.2,vars = c("b0", "b1","b2","b3","b4", "phi.ROS"))
+
+
+summary(model.sigmoid.2,vars = c("b0", "b1","b2","b3","b4", "phi.ROS"))
+
+
+
+LogLik.model.sigmoid.2 <- do.call(rbind, model.sigmoid.2$mcmc)
+LogLik.model.sigmoid.2 <- LogLik.model.sigmoid.2[,str_detect(colnames(LogLik.model.sigmoid.2),"LogLik")]
+waic.model.sigmoid.2 <- loo::waic(LogLik.model.sigmoid.2)
+loo.model.sigmoid.2 <- loo::loo(LogLik.model.sigmoid.2)
+```
+
+X1 = wind speed
+X2 = temperature
+X3 = relative humidity
+X4 = drought factor
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+fn_jags_predict_plot(model.sigmoid.2$mcmc,model.sigmoid.data.2,dat.join.2,"X1",4)
+fn_jags_predict_plot(model.sigmoid.2$mcmc,model.sigmoid.data.2,dat.join.2,"X2",4)
+fn_jags_predict_plot(model.sigmoid.2$mcmc,model.sigmoid.data.2,dat.join.2,"X3",4)
+fn_jags_predict_plot(model.sigmoid.2$mcmc,model.sigmoid.data.2,dat.join.2,"X4",4)
+#print(fn_jags_resids_plot(model.sigmoid.2$mcmc,model.sigmoid.data.2))
+```
+
+
+
+
+
+
+### Bayesian model of ROS - best WAIC surface variables
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+dat.join.3 <- dat.weather %>% 
+    filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = wnd_kmh_10m_max,X2=relhum_sfc_min) 
+
+X1_mean <- mean(dat.join.3$X1)
+X1_sd <- sd(dat.join.3$X1)
+
+X2_mean <- mean(dat.join.3$X2)
+X2_sd <- sd(dat.join.3$X2)
+
+dat.sum.3.orgnl <- data.frame(X1_mean,X1_sd,X2_mean,X2_sd)
+names(dat.sum.3.orgnl) <- paste0(names(dat.sum.3.orgnl),"_orgnl")
+
+dat.join.3 <- dat.join.3 %>% 
+  mutate(X1=scale_this(X1),
+         X2=scale_this(X2)) %>% 
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+
+
+### Data for model
+model.sigmoid.data.3 <- c(as.list(dat.join.3), 
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+
+
+
+### Run/Sample
+model.sigmoid.3 <- run.jags(model.sigmoid.code.X2,
+                         monitor = c("b0", "b1","b2", "phi.ROS", "z.sd", "LogLik"),
+                         data = model.sigmoid.data.3, 
+                         n.chains = 6, 
+                         burnin = 1000, 
+                         sample = 2000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = runif(1,-1,1),
+                             b2 = runif(1,-1,1),
+                             phi.ROS = 1
+                           )
+                         })
+
+
+plot(model.sigmoid.3,vars = c("b0", "b1","b2", "phi.ROS"))
+
+
+summary(model.sigmoid.3,vars = c("b0", "b1","b2", "phi.ROS"))
+
+LogLik.model.sigmoid.3 <- do.call(rbind, model.sigmoid.3$mcmc)
+LogLik.model.sigmoid.3 <- LogLik.model.sigmoid.3[,str_detect(colnames(LogLik.model.sigmoid.3),"LogLik")]
+waic.model.sigmoid.3 <- loo::waic(LogLik.model.sigmoid.3)
+loo.model.sigmoid.3 <- loo::loo(LogLik.model.sigmoid.3)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+fn_jags_predict_plot(model.sigmoid.3$mcmc,model.sigmoid.data.3,dat.join.3,"X1",2)
+fn_jags_predict_plot(model.sigmoid.3$mcmc,model.sigmoid.data.3,dat.join.3,"X2",2)
+#print(fn_jags_resids_plot(model.sigmoid.3$mcmc,model.sigmoid.data.3))
+```
+
+
+
+### A bayesian model of ROS - surface variables best WAIC/loo v2
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+dat.join.4 <- dat.weather %>% 
+    filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = wnd_kmh_10m_max, X2 = relhum_sfc_min, X3=soil_mois_lv1_min) 
+
+X1_mean <- mean(dat.join.4$X1)
+X1_sd <- sd(dat.join.4$X1)
+
+X2_mean <- mean(dat.join.4$X2)
+X2_sd <- sd(dat.join.4$X2)
+
+X3_mean <- mean(dat.join.4$X3)
+X3_sd <- sd(dat.join.4$X3)
+
+dat.sum.4.orgnl <- data.frame(X1_mean,X1_sd,X2_mean,X2_sd,X3_mean,X3_sd) 
+names(dat.sum.4.orgnl) <- paste0(names(dat.sum.4.orgnl),"_orgnl")
+
+dat.join.4 <- dat.join.4 %>% 
+  mutate(X1=scale_this(X1),
+         X2=scale_this(X2),
+         X3=scale_this(X3)) %>% 
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+
+
+### Data for model
+model.sigmoid.data.4 <- c(as.list(dat.join.4), 
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+
+
+
+### Run/Sample
+model.sigmoid.4 <- run.jags(model.sigmoid.code.X3,
+                         monitor = c("b0", "b1","b2","b3", "phi.ROS", "z.sd", "LogLik"),
+                         data = model.sigmoid.data.4, 
+                         n.chains = 6, 
+                         burnin = 1000, 
+                         sample = 2000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = runif(1,-1,1),
+                             b2 = runif(1,-1,1),
+                             b3 = runif(1,-1,1),
+                             phi.ROS = 1
+                           )
+                         })
+
+
+plot(model.sigmoid.4,vars = c("b0", "b1","b2","b3", "phi.ROS"))
+
+
+summary(model.sigmoid.4,vars = c("b0", "b1","b2","b3", "phi.ROS"))
+
+
+LogLik.model.sigmoid.4 <- do.call(rbind, model.sigmoid.4$mcmc)
+LogLik.model.sigmoid.4 <- LogLik.model.sigmoid.4[,str_detect(colnames(LogLik.model.sigmoid.4),"LogLik")]
+waic.model.sigmoid.4 <- loo::waic(LogLik.model.sigmoid.4)
+loo.model.sigmoid.4 <- loo::loo(LogLik.model.sigmoid.4)
+
+
+```
+
+X1= wind speed max of surface layers
+X2= vapour pressure deficit max of surface layers
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+fn_jags_predict_plot(model.sigmoid.4$mcmc,model.sigmoid.data.4,dat.join.4,"X1",3)
+fn_jags_predict_plot(model.sigmoid.4$mcmc,model.sigmoid.data.4,dat.join.4,"X2",3)
+fn_jags_predict_plot(model.sigmoid.4$mcmc,model.sigmoid.data.4,dat.join.4,"X3",3)
+#print(fn_jags_resids_plot(model.sigmoid.4$mcmc,model.sigmoid.data.4))
+```
+
+
+
+
+
+
+
+### WAIC and LOO comparison
+
+model at zero is best
+
+```{r echo=FALSE}
+print("WAIC")
+loo::loo_compare(waic.model.sigmoid.1,waic.model.sigmoid.2,waic.model.sigmoid.3,waic.model.sigmoid.4)
+
+waic.model.sigmoid.1$estimates
+waic.model.sigmoid.2$estimates
+waic.model.sigmoid.3$estimates
+#waic.model.sigmoid.4$estimates
+
+
+print("LOO")
+loo::loo_compare(loo.model.sigmoid.1,loo.model.sigmoid.2,loo.model.sigmoid.3,loo.model.sigmoid.4)
+
+loo.model.sigmoid.1$estimates
+loo.model.sigmoid.2$estimates
+loo.model.sigmoid.3$estimates
+#loo.model.sigmoid.4$estimates
+
+```
+
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#write results to file to be used for shiny prediction plots
+
+outfold <- "D:\\UOW_PhD\\ROS_scans\\Analysis\\Statistics\\MichaelBedward\\fire_spread_rate\\data\\model_outputs\\"
+
+post.1 <- do.call(rbind,model.sigmoid.1$mcmc) 
+post.1 <- post.1 %>% data.frame() %>% 
+  select(starts_with("b"),"z.sd","phi.ROS") %>% 
+  mutate(z=rnorm(nrow(.),0,z.sd))
+
+post.2 <- do.call(rbind,model.sigmoid.2$mcmc) 
+post.2 <- post.2 %>% data.frame() %>% 
+  select(starts_with("b"),"z.sd","phi.ROS")%>% 
+  mutate(z=rnorm(nrow(.),0,z.sd))
+ 
+
+post.3 <- do.call(rbind,model.sigmoid.3$mcmc) 
+post.3 <- post.3 %>% data.frame() %>% 
+  select(starts_with("b"),"z.sd","phi.ROS")%>% 
+  mutate(z=rnorm(nrow(.),0,z.sd))
+ 
+
+ post.4 <- do.call(rbind,model.sigmoid.4$mcmc) 
+ post.4 <- post.4 %>% data.frame() %>% 
+   select(starts_with("b"),"z.sd","phi.ROS") %>% 
+   mutate(z=rnorm(nrow(.),0,z.sd))
+
+write.csv(post.1,paste0(outfold,"post.1.csv"))
+write.csv(post.2,paste0(outfold,"post.2.csv"))
+write.csv(post.3,paste0(outfold,"post.3.csv"))
+write.csv(post.4,paste0(outfold,"post.4.csv"))
+
+
+dat.sum.1 <- model.sigmoid.data.1[startsWith(names(model.sigmoid.data.1),"X")] %>% 
+  data.frame() %>% 
+  mutate(test=1) %>% 
+  summarise_all(list(min=min,max=max,sd=sd,mean=mean,median=median),na.rm=TRUE) %>% 
+  select(-starts_with("test")) %>% 
+  cbind(dat.sum.1.orgnl,ROS.MAX)
+
+dat.sum.2 <- model.sigmoid.data.2[startsWith(names(model.sigmoid.data.2),"X")] %>% 
+  data.frame() %>% 
+  mutate(test=1) %>% 
+  summarise_all(list(min=min,max=max,sd=sd,mean=mean,median=median),na.rm=TRUE) %>% 
+  select(-starts_with("test"))%>% 
+  cbind(dat.sum.2.orgnl,ROS.MAX)
+
+dat.sum.3 <- model.sigmoid.data.3[startsWith(names(model.sigmoid.data.3),"X")] %>% 
+  data.frame() %>% 
+  mutate(test=1) %>% 
+  summarise_all(list(min=min,max=max,sd=sd,mean=mean,median=median),na.rm=TRUE) %>% 
+  select(-starts_with("test"))%>% 
+  cbind(dat.sum.3.orgnl,ROS.MAX)
+
+
+ dat.sum.4 <- model.sigmoid.data.4[startsWith(names(model.sigmoid.data.4),"X")] %>% 
+   data.frame() %>% 
+   mutate(test=1) %>% 
+   summarise_all(list(min=min,max=max,sd=sd,mean=mean,median=median),na.rm=TRUE) %>% 
+   select(-starts_with("test"))%>% 
+   cbind(dat.sum.4.orgnl,ROS.MAX)
+
+
+
+write.csv(dat.sum.1,paste0(outfold,"dat.sum.1.csv"))
+write.csv(dat.sum.2,paste0(outfold,"dat.sum.2.csv"))
+write.csv(dat.sum.3,paste0(outfold,"dat.sum.3.csv"))
+write.csv(dat.sum.4,paste0(outfold,"dat.sum.4.csv"))
+
+
+md1 <- model.sigmoid.data.1[startsWith(names(model.sigmoid.data.1),"X")] %>% data.frame() %>% 
+  cbind(data.frame(model.sigmoid.data.1[startsWith(names(model.sigmoid.data.1),"line")]))
+
+md2 <- model.sigmoid.data.2[startsWith(names(model.sigmoid.data.2),"X")] %>% data.frame() %>% 
+  cbind(data.frame(model.sigmoid.data.2[startsWith(names(model.sigmoid.data.2),"line")]))
+
+md3 <- model.sigmoid.data.3[startsWith(names(model.sigmoid.data.3),"X")] %>% data.frame() %>% 
+  cbind(data.frame(model.sigmoid.data.3[startsWith(names(model.sigmoid.data.3),"line")]))
+
+md4 <- model.sigmoid.data.4[startsWith(names(model.sigmoid.data.4),"X")] %>% data.frame() %>% 
+  cbind(data.frame(model.sigmoid.data.4[startsWith(names(model.sigmoid.data.4),"line")]))
+
+write.csv(md1,paste0(outfold,"model.x.data.1.csv"))
+write.csv(md2,paste0(outfold,"model.x.data.2.csv"))
+write.csv(md3,paste0(outfold,"model.x.data.3.csv"))
+write.csv(md4,paste0(outfold,"model.x.data.4.csv"))
+
+
+
+
+
+```
+
+
+
+### now test the best model with fuel added
+
+```{r}
+
+#sigmoid code for 3 weather var
+
+model.sigmoid.code.X3.fuel <- "model {
+  for (i in 1:length(X1)) {
+    X1[i] ~ dnorm(mu.X1[lineid[i]], phi.X1[lineid[i]])
+    X2[i] ~ dnorm(mu.X2[lineid[i]], phi.X2[lineid[i]])
+    X3[i] ~ dnorm(mu.X3[lineid[i]], phi.X3[lineid[i]])
+  }
+
+  for (i in 1:max(lineid)) {  
+    mu.X1[i] ~ dnorm(0, 1)
+    phi.X1[i] ~ dexp(1)
+    
+    mu.X2[i] ~ dnorm(0, 1)
+    phi.X2[i] ~ dexp(1)
+    
+    mu.X3[i] ~ dnorm(0, 1)
+    phi.X3[i] ~ dexp(1)
+  }
+  
+  for (i in 1:max(lineid)) {
+    ROS[i] ~ dgamma(phi.ROS * mu.ROS[i], phi.ROS)
+  
+    mu.ROS[i] <- ROS.MAX / (1 + exp(lp[i]))
+    
+    # linear predictor
+    lp[i] <- b0 + b1*mu.X1[i]  + b2*mu.X2[i] + b3*mu.X3[i] + b4 * fuel[i] + z[groupseqid[i]]
+    
+    #add the loglikelihood for each observation to allow WAIC calculation
+    
+    LogLik[i]<-logdensity.gamma(ROS[i],phi.ROS * mu.ROS[i], phi.ROS)
+  }
+
+  # random effect
+  for (i in 1:max(groupseqid)) {
+    z[i] ~ dnorm(0, z.prec)
+  }
+  
+  # Priors for ROS regression parameters
+  b0 ~ dnorm(0, 0.1)
+  b1 ~ dnorm(0, 1)
+  b2 ~ dnorm(0, 1)
+  b3 ~ dnorm(0, 1)
+  b4 ~ dnorm(0, 5)
+
+  # Prior for Gamma dispersion
+  phi.ROS ~ dexp(1)
+  
+  # Prior for random effect standard deviation
+  z.sd ~ dexp(1)
+  z.prec <- pow(z.sd, -2)
+}"
+
+
+```
+
+
+Run the fuel jags model
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+
+dat.join <- dat.weather %>% 
+    filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid, groupseqid), by = "NAME2") %>%
+  select(lineid, X1 = wnd_kmh_10m_max,X2=relhum_sfc_min,X3=soil_mois_lv1_min) 
+
+X1_mean <- mean(dat.join$X1)
+X1_sd <- sd(dat.join$X1)
+
+X2_mean <- mean(dat.join$X2)
+X2_sd <- sd(dat.join$X2)
+
+X3_mean <- mean(dat.join$X3)
+X3_sd <- sd(dat.join$X3)
+
+dat.sum.orgnl <- data.frame(X1_mean,X1_sd,X2_mean,X2_sd,X3_mean,X3_sd)
+names(dat.sum.orgnl) <- paste0(names(dat.sum.orgnl),"_orgnl")
+
+dat.join <- dat.join %>% 
+  mutate(X1=scale_this(X1),
+         X2=scale_this(X2),
+         X3=scale_this(X3)) %>% 
+  arrange(lineid)
+
+
+# Note - it is important to ensure that the ROS values are in lineid order
+dat.ros <- dat.lines %>% 
+  arrange(lineid) %>%
+  select(lineid, ROS, groupseqid)
+
+dat.fuel <- dat.landscape %>% 
+  select(NAME2,accum_tns_sfcelev) %>% 
+  filter(NAME2 %in% dat.lines$NAME2) %>% 
+  left_join(dat.lines %>% select(NAME2, lineid), by = "NAME2") %>% 
+  select(lineid_f=lineid,fuel=accum_tns_sfcelev) %>% 
+  arrange(lineid_f) %>% 
+  group_by(lineid_f) %>% 
+  summarise(fuel=mean(fuel))
+
+
+
+### Data for model
+model.sigmoid.data.fuel <- c(as.list(dat.join), 
+                          as.list(dat.fuel),
+                        list(ROS = dat.ros$ROS, 
+                             groupseqid = dat.ros$groupseqid, 
+                             ROS.MAX = ROS.MAX))
+
+
+
+
+### Run/Sample
+model.sigmoid.fuel <- run.jags(model.sigmoid.code.X3.fuel,
+                         monitor = c("b0", "b1","b2","b3","b4", "phi.ROS", "z.sd", "LogLik"),
+                         data = model.sigmoid.data.fuel, 
+                         n.chains = 6, 
+                         burnin = 1000, 
+                         sample = 2000, 
+                         thin = 10,
+                         method = "parallel",
+                         inits = function() {
+                           list(
+                             b0 = 0,
+                             b1 = runif(1,-1,1),
+                             b2 = runif(1,-1,1),
+                             b3 = runif(1,-1,1),
+                             b4 = runif(1,-1,1),
+                             phi.ROS = 1
+                           )
+                         })
+
+
+plot(model.sigmoid.fuel,vars = c("b0", "b1", "b2","b3","b4", "phi.ROS"))
+
+
+summary(model.sigmoid.fuel,vars = c("b0", "b1", "b2","b3","b4", "phi.ROS"))
+
+LogLik.model.sigmoid.fuel <- do.call(rbind, model.sigmoid.fuel$mcmc)
+LogLik.model.sigmoid.fuel <- LogLik.model.sigmoid.fuel[,str_detect(colnames(LogLik.model.sigmoid.fuel),"LogLik")]
+waic.model.sigmoid.fuel <- loo::waic(LogLik.model.sigmoid.fuel)
+loo.model.sigmoid.fuel <- loo::loo(LogLik.model.sigmoid.fuel)
+
+```
+
+
+```{r}
+loo::loo_compare(waic.model.sigmoid.1,waic.model.sigmoid.2,waic.model.sigmoid.3,waic.model.sigmoid.4,waic.model.sigmoid.fuel)
+```
+
+
+
+
+mean trend plots for the fuel model
+### Mean trend plots - Wind speed and RH and soil moisture model
+wind speed
+
+```{r}
+
+# Prediction function
+fn_predict <- function(x1,x2,x3,fuel, b0, b1,b2,b3,b4) { 
+  lp <- b0 + b1*x1+ b2*x2 + b3 * x3 + b4 * fuel
+  ROS.MAX / (1 + exp(lp))
+}
+
+model_data <- model.sigmoid.data.fuel
+
+post <- do.call(rbind, model.sigmoid.fuel$mcmc)
+post <- post[, c("b0", "b1","b2","b3","b4")]
+```
+
+Wind speed
+```{r}
+var_name="wind_speed"
+
+var_sequence <-  seq(0,60,1)
+var_sequence_labs <-  seq(0,60,10)
+  
+pX1 <- (var_sequence-X1_mean)/X1_sd
+pX1.labs <- (var_sequence_labs-X1_mean)/X1_sd
+pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+pXfuel <- mean(model_data["fuel"][[1]],na.rm = TRUE)
+
+
+
+ pdat <- apply(post, 1, function(params) {
+      fn_predict(pX1,pX2,pX3,pXfuel, params[1], params[2], params[3],params[4],params[5])
+    })
+
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+
+
+
+pdat.stats["plotX"] <- pX1
+
+# For comparison, plot points for ROS vs mean X1 for each line
+dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+  group_by(lineid) %>%
+  summarize(plotX = mean(X1)) %>%
+  left_join(dat.ros, by = "lineid")
+
+g <- ggplot(data = pdat.stats, aes(x = plotX)) +
+    geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+    geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+    geom_line(aes(y = mid)) +
+    
+    geom_point(data = dat.obs, aes(y = ROS),
+               size = 2, alpha = 0.3) +
+    
+    labs(x = var_name, y = "Predicted ROS") +
+    scale_x_continuous(breaks = pX1.labs,labels = var_sequence_labs) +
+    scale_y_continuous(breaks = seq(0,10,1),limits=c(0,10))
+  
+g
+
+```
+
+
+
+RH
+```{r}
+var_name="RH"
+
+var_sequence <-  seq(0,60,1)
+var_sequence_labs <-  seq(0,60,10)
+  
+pX2 <- (var_sequence-X2_mean)/X2_sd
+pX2.labs <- (var_sequence_labs-X2_mean)/X2_sd
+pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+pXfuel <- mean(model_data["fuel"][[1]],na.rm = TRUE)
+
+
+
+ pdat <- apply(post, 1, function(params) {
+      fn_predict(pX1,pX2,pX3,pXfuel, params[1], params[2], params[3],params[4],params[5])
+    })
+
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+
+
+
+pdat.stats["plotX"] <- pX2
+
+# For comparison, plot points for ROS vs mean X1 for each line
+dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+  group_by(lineid) %>%
+  summarize(plotX = mean(X2)) %>%
+  left_join(dat.ros, by = "lineid")
+
+g <- ggplot(data = pdat.stats, aes(x = plotX)) +
+    geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+    geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+    geom_line(aes(y = mid)) +
+    
+    geom_point(data = dat.obs, aes(y = ROS),
+               size = 2, alpha = 0.3) +
+    
+    labs(x = var_name, y = "Predicted ROS") +
+    scale_x_continuous(breaks = pX1.labs,labels = var_sequence_labs) +
+    scale_y_continuous(breaks = seq(0,10,1),limits=c(0,10))
+  
+g
+
+```
+
+
+
+
+Soil mois
+```{r}
+var_name="soil mois"
+
+var_sequence <-  seq(0,20,1)
+var_sequence_labs <-  seq(0,20,5)
+  
+pX3 <- (var_sequence-X3_mean)/X3_sd
+pX3.labs <- (var_sequence_labs-X3_mean)/X3_sd
+pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+pXfuel <- mean(model_data["fuel"][[1]],na.rm = TRUE)
+
+
+
+ pdat <- apply(post, 1, function(params) {
+      fn_predict(pX1,pX2,pX3,pXfuel, params[1], params[2], params[3],params[4],params[5])
+    })
+
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+
+
+
+pdat.stats["plotX"] <- pX3
+
+# For comparison, plot points for ROS vs mean X1 for each line
+dat.obs <- dat.join %>%  # see earlier chunk for dat.join
+  group_by(lineid) %>%
+  summarize(plotX = mean(X3)) %>%
+  left_join(dat.ros, by = "lineid")
+
+g <- ggplot(data = pdat.stats, aes(x = plotX)) +
+    geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+    geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+    geom_line(aes(y = mid)) +
+    
+    geom_point(data = dat.obs, aes(y = ROS),
+               size = 2, alpha = 0.3) +
+    
+    labs(x = var_name, y = "Predicted ROS") +
+    scale_x_continuous(breaks = pX3.labs,labels = var_sequence_labs) +
+    scale_y_continuous(breaks = seq(0,10,1),limits=c(0,10))
+  
+g
+
+```
+
+
+fuel
+```{r}
+var_name="fuel"
+
+var_sequence <-  seq(0,40,1)
+var_sequence_labs <-  seq(0,40,10)
+  
+pXfuel <- var_sequence
+pXfuel.labs <- var_sequence_labs
+pX2 <- mean(model_data["X2"][[1]],na.rm = TRUE)
+pX3 <- mean(model_data["X3"][[1]],na.rm = TRUE)
+pX1 <- mean(model_data["X1"][[1]],na.rm = TRUE)
+
+
+
+ pdat <- apply(post, 1, function(params) {
+      fn_predict(pX1,pX2,pX3,pXfuel, params[1], params[2], params[3],params[4],params[5])
+    })
+
+pdat.stats <- apply(pdat, 1, function(x) {
+  quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975),na.rm = T)})
+
+# Transpose and add input values for plotting
+pdat.stats <- t(pdat.stats)
+colnames(pdat.stats) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+pdat.stats <- as.data.frame(pdat.stats)
+
+
+
+pdat.stats["plotX"] <- pXfuel
+
+# For comparison, plot points for ROS vs mean X1 for each line
+dat.obs <- dat.fuel %>%  # see earlier chunk for dat.join
+  mutate(plotX = fuel,lineid=lineid_f) %>%
+  left_join(dat.ros, by = "lineid")
+
+g <- ggplot(data = pdat.stats, aes(x = plotX)) +
+    geom_ribbon(aes(ymin = lwr95, ymax = upr95), alpha = 0.2) +
+    geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+    geom_line(aes(y = mid)) +
+    
+    geom_point(data = dat.obs, aes(y = ROS),
+               size = 2, alpha = 0.3) +
+    
+    labs(x = var_name, y = "Predicted ROS") +
+    scale_x_continuous(breaks = pXfuel.labs,labels = var_sequence_labs) +
+    scale_y_continuous(breaks = seq(0,10,1),limits=c(0,10))
+  
+g
+
+```
+
+
+
