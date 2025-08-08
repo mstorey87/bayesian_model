@@ -75,21 +75,28 @@ data {
   matrix[Nr, Nv] X;  // matrix with columns for intercept (1) and predictors
   
   vector<lower=0>[Nv] PriorSD;  // standard deviation to use for each prior
+  real<lower=0> PriorShape;     // mean for prior on Gamma shape: exponential(1.0/PriorShape) 
 }
 parameters {
   vector[Nv] beta;
+  real<lower=0> shape;  // Gamma shape parameter
 }
 model {
   // Note: no model being fitted here, just sampling prior values.
   beta ~ normal(0, PriorSD);
+  shape ~ exponential(1.0 / PriorShape);
 }
 generated quantities {
   vector[Nr] lp;
   vector[Nr] ros_mean;
+  array[Nr] real ros_obs;
 
   // predicted mean ROS
   lp = X*beta;
   ros_mean = MaxROS / (1 + exp(-lp));
+  
+  // predicted ROS observations
+  ros_obs = gamma_rng(shape, shape / ros_mean);
 }
 "
 
@@ -124,7 +131,8 @@ Run the model with fairly narrow normal(0, 0.2) priors for all parameters.
 model_data <- list(X = mmat, 
                    Nr = nrow(mmat), Nv = ncol(mmat), 
                    MaxROS = 15.0,
-                   PriorSD = c(1.0, 0.2, 0.2, 0.2))
+                   PriorSD = c(1.0, 0.2, 0.2, 0.2),
+                   PriorShape = 20)
 
 fit <- fit_model(sim_model_code, data = model_data)
 
@@ -138,7 +146,7 @@ fit <- fit_model(sim_model_code, data = model_data)
 Ndraws <- 100
 
 prior_sim <- fit %>%
-  tidybayes::spread_draws(ros_mean[i], ndraws = Ndraws) %>%
+  tidybayes::spread_draws(shape, ros_mean[i], ros_obs[i], ndraws = Ndraws) %>%
   ungroup() %>%
 
   mutate(wind = dat$wind[i],
