@@ -1,0 +1,223 @@
+---
+title: "Prior simulation for ROS models"
+author: "MB"
+date: "2025-08-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(stringr)
+library(here)
+
+library(cmdstanr)
+library(posterior)
+library(tidybayes)
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+MODEL_DIR <- here("stan_models")
+if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
+
+```
+
+
+### Helper function to fit a Stan model
+
+```{r}
+
+fit_model <- function(model_code, data=list(), 
+                      model_dir = MODEL_DIR, 
+                      model_basename = NULL,
+                      seed=123, chains=4,refresh=0) {
+  
+  if (is.null(model_basename)) {
+    model_basename <- deparse(substitute(model_code))
+    
+    # remove '_code' from the base name if present
+    model_basename <- sub(model_basename, pattern = "_code", replacement = "")
+  }
+  
+  f <- write_stan_file(model_code, 
+                       dir = model_dir, 
+                       basename = model_basename)
+  
+  model_x <- cmdstan_model(f)
+  samples_1 <- model_x$sample(
+    data = data,
+    seed = seed,
+    chains = chains,
+    parallel_chains = chains,
+    refresh = 0
+  )
+  
+  return(samples_1)
+}
+
+```
+
+
+
+### Stan model code
+
+This model expects (artificial) predictor values via a model matrix `X`. There are no observed ROS values. The `model` block is only used to sample values from the prior parameter distributions, while the `generated quantities` block is used to calculate the predicted value of mean ROS.
+
+```{r}
+
+sim_model_code <- "
+data {
+  real MaxROS;       // Upper limit on rate of spread
+  int<lower=1> Nr;   // number of data records
+  int<lower=1> Nv;   // number of predictor variables including the intercept
+  matrix[Nr, Nv] X;  // matrix with columns for intercept (1) and predictors
+  
+  real<lower=0> PriorSD;  // common standard deviation to use for priors
+}
+parameters {
+  vector[Nv] beta;
+}
+model {
+  // Note: no model being fitted here, just sampling prior values.
+  beta ~ normal(0, PriorSD);
+}
+generated quantities {
+  vector[Nr] lp;
+  vector[Nr] ros_mean;
+
+  // predicted mean ROS
+  lp = X*beta;
+  ros_mean = MaxROS / (1 + exp(-lp));
+}
+"
+
+```
+
+
+### Run the simulation
+
+Prepare some pretend predictor data (wind and RH) and create the model matrix.
+
+```{r}
+
+# Some standardized wind values
+wind_vals <- seq(-3, 3, length.out = 10)
+
+# Some RH values as proportions
+rh_vals = seq(0.1, 0.9, length.out = 9)
+
+# Orthogonal combinations
+dat <- expand.grid(wind = wind_vals, rh = rh_vals)
+
+# Model matrix with intercept, main effects and interaction.
+mmat <- model.matrix(~ wind*rh, data = dat)
+
+```
+
+
+Run the model with fairly narrow normal(0, 0.2) priors for all parameters.
+
+```{r}
+
+model_data <- list(X = mmat, 
+                   Nr = nrow(mmat), Nv = ncol(mmat), 
+                   MaxROS = 15.0,
+                   PriorSD = 0.2)
+
+fit <- fit_model(sim_model_code, data = model_data)
+
+```
+
+
+### Graph simulated mean ROS values against each predictor
+
+```{r}
+
+Ndraws <- 100
+
+prior_sim <- fit %>%
+  tidybayes::spread_draws(ros_mean[i], ndraws = Ndraws) %>%
+  ungroup() %>%
+
+  mutate(wind = dat$wind[i],
+         rh = dat$rh[i])
+
+dat_gg <- prior_sim %>%
+  tidyr::pivot_longer(c(wind, rh), names_to = "predictor", values_to = "value")
+
+ggplot(data = dat_gg, aes(x = value, y = ros_mean)) +
+  geom_jitter(size = 2, alpha = 0.05, width = 0.1, height = 0) +
+  geom_hline(yintercept = model_data$MaxROS, colour = "blue", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~predictor, scales = "free_x")
+
+```
+
+
+Run the model again with wider normal(0, 0.5) priors.
+
+```{r}
+
+model_data$PriorSD <- 0.5
+
+fit <- fit_model(sim_model_code, data = model_data)
+
+```
+
+
+Graph the new simulation results.
+
+```{r}
+
+Ndraws <- 100
+
+prior_sim <- fit %>%
+  tidybayes::spread_draws(ros_mean[i], ndraws = Ndraws) %>%
+  ungroup() %>%
+
+  mutate(wind = dat$wind[i],
+         rh = dat$rh[i])
+
+dat_gg <- prior_sim %>%
+  tidyr::pivot_longer(c(wind, rh), names_to = "predictor", values_to = "value")
+
+ggplot(data = dat_gg, aes(x = value)) +
+  geom_jitter(aes(y = ros_mean), size = 2, alpha = 0.05, width = 0.02, height = 0) +
+  geom_hline(yintercept = model_data$MaxROS, colour = "blue", linetype = "dashed", linewidth = 1) +
+  labs(y = "Mean ROS") +
+  facet_wrap(~predictor, scales = "free_x")
+
+```
+
+
+Alternative graph showing quantile regions.
+
+```{r}
+
+fn_q <- function(x, probs = c(0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)) {
+  qs <- quantile(x, probs = probs)
+  data.frame(q = qs, prob = probs)
+}
+
+
+dat_gg_q <- dat_gg %>%
+  reframe(fn_q(ros_mean), .by = c(predictor, value)) %>%
+  tidyr::pivot_wider(names_from = prob, names_prefix = "p", values_from = q)
+
+
+ggplot(data = dat_gg_q, aes(x = value)) +
+  geom_ribbon(aes(ymin = p0.01, ymax = p0.99), alpha = 0.2) +
+  geom_ribbon(aes(ymin = p0.05, ymax = p0.95), alpha = 0.2) +
+  geom_ribbon(aes(ymin = p0.1, ymax = p0.9), alpha = 0.2) +
+  geom_ribbon(aes(ymin = p0.25, ymax = p0.75), alpha = 0.2) +
+  
+  geom_hline(yintercept = model_data$MaxROS, colour = "blue", linetype = "dashed", linewidth = 1) +
+  
+  labs(y = "Mean ROS") +
+
+  facet_wrap(~predictor, scales = "free_x")
+
+```
+
+
