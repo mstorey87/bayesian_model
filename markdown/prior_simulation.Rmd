@@ -74,7 +74,7 @@ data {
   int<lower=1> Nv;   // number of predictor variables including the intercept
   matrix[Nr, Nv] X;  // matrix with columns for intercept (1) and predictors
   
-  real<lower=0> PriorSD;  // common standard deviation to use for priors
+  vector<lower=0>[Nv] PriorSD;  // standard deviation to use for each prior
 }
 parameters {
   vector[Nv] beta;
@@ -124,7 +124,7 @@ Run the model with fairly narrow normal(0, 0.2) priors for all parameters.
 model_data <- list(X = mmat, 
                    Nr = nrow(mmat), Nv = ncol(mmat), 
                    MaxROS = 15.0,
-                   PriorSD = 0.2)
+                   PriorSD = c(1.0, 0.2, 0.2, 0.2))
 
 fit <- fit_model(sim_model_code, data = model_data)
 
@@ -159,7 +159,7 @@ Run the model again with wider normal(0, 0.5) priors.
 
 ```{r}
 
-model_data$PriorSD <- 0.5
+model_data$PriorSD <- c(0.2, 1.0, 1.0, 1.0)
 
 fit <- fit_model(sim_model_code, data = model_data)
 
