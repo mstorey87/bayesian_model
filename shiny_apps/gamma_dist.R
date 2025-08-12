@@ -29,7 +29,11 @@ ui <- page_sidebar(
                 min = 1, 
                 max = 50, 
                 step = 0.1,
-                ticks = FALSE)
+                ticks = FALSE),
+    
+    checkboxInput("show_maxROS", 
+                  "Show max mean ROS", 
+                  value = TRUE)
   ),
   
   # Main panel with the density plot
@@ -56,7 +60,9 @@ server <- function(input, output, session) {
   output$density_plot <- renderPlot({
     # Calculate appropriate x range for plotting
     x_min <- 0
-    x_max <- max(ROS_MAX + 1, qgamma(0.99, input$shape, rate()))
+    
+    x_max <- qgamma(0.99, input$shape, rate())
+    if (input$show_maxROS ) x_max <- max(x_max, ROS_MAX + 1)
     
     # Generate x values for density curve
     x_vals <- seq(x_min, x_max, length.out = 1000)
@@ -68,20 +74,23 @@ server <- function(input, output, session) {
     plot_data <- data.frame(x = x_vals, density = density_vals)
     
     # Create the plot
-    ggplot(plot_data, aes(x = x, y = density)) +
-      geom_vline(xintercept = ROS_MAX, colour = "darkred", linewidth = 1) +
-      annotate("text", x = ROS_MAX, y = max(density_vals) * 0.8,
-               label = "Max mean ROS",
-               hjust = -0.1, colour = "darkred") +
+    gg <- ggplot(plot_data, aes(x = x, y = density))
+    
+    if (input$show_maxROS) {
+      gg <- gg + geom_vline(xintercept = ROS_MAX, colour = "darkred", linewidth = 1) +
+        annotate("text", x = ROS_MAX, y = max(density_vals) * 0.8,
+                 label = "Max mean ROS",
+                 hjust = -0.1, colour = "darkred")
+    }
       
-      geom_line(colour = "steelblue", size = 1.2) +
+    gg + geom_line(colour = "steelblue", size = 1.2) +
       
       geom_area(alpha = 0.3, fill = "steelblue") +
       
       geom_vline(xintercept = input$mean, colour = "darkblue", linetype = "dashed", linewidth = 1) +
       
       annotate("text", x = input$mean, y = max(density_vals) * 0.9, 
-               label = paste("Mean =", round(input$mean, 2)), 
+               label = "Mean",
                hjust = -0.1, colour = "darkblue") +
       
       labs(x = "Value",
@@ -95,7 +104,7 @@ server <- function(input, output, session) {
   output$stats <- renderText({
     # Calculate statistics
     mode_val <- ifelse(input$shape > 1, (input$shape - 1) / rate(), 0)
-    range_90 <- qgamma(c(0.05, 0.95), input$shape, input$mean / input$mean)
+    range_90 <- qgamma(c(0.05, 0.95), input$shape, rate())
     prob_exceed <- 1.0 - pgamma(ROS_MAX, input$shape, rate())
 
     paste0("Mean: ", round(input$mean, 3), "\n",
